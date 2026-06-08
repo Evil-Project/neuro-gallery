@@ -1,11 +1,3 @@
-export const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
-export const MAX_UPLOAD_FILES = 8;
-export const MAX_UPLOAD_TOTAL_BYTES = MAX_UPLOAD_BYTES * MAX_UPLOAD_FILES;
-export const MAX_UPLOAD_MULTIPART_OVERHEAD_BYTES = 1024 * 1024;
-export const MAX_UPLOAD_BODY_BYTES = MAX_UPLOAD_TOTAL_BYTES + MAX_UPLOAD_MULTIPART_OVERHEAD_BYTES;
-export const MAX_UPLOAD_SIZE_LABEL = "10 MB";
-export const MAX_UPLOAD_TOTAL_SIZE_LABEL = "80 MB";
-
 export const ACCEPTED_IMAGE_TYPES = [
   "image/avif",
   "image/gif",
@@ -13,3 +5,10 @@ export const ACCEPTED_IMAGE_TYPES = [
   "image/png",
   "image/webp",
 ] as const;
+
+export const DEFAULT_CHUNKED_UPLOAD_PART_BYTES = 8 * 1024 * 1024;
+export const MAX_MULTIPART_UPLOAD_PARTS = 10_000;
+
+export function selectChunkedUploadPartSize(fileSize: number): number {
+  return Math.max(DEFAULT_CHUNKED_UPLOAD_PART_BYTES, Math.ceil(fileSize / MAX_MULTIPART_UPLOAD_PARTS));
+}

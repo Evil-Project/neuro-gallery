@@ -16,14 +16,7 @@ import {
 } from "lucide-react";
 import { deleteImage, fetchAuthSession, fetchImages, fetchRandomImage, login, logout, uploadImages } from "./api";
 import type { GalleryImage } from "./types";
-import {
-  ACCEPTED_IMAGE_TYPES,
-  MAX_UPLOAD_BYTES,
-  MAX_UPLOAD_FILES,
-  MAX_UPLOAD_SIZE_LABEL,
-  MAX_UPLOAD_TOTAL_BYTES,
-  MAX_UPLOAD_TOTAL_SIZE_LABEL,
-} from "../uploadLimits";
+import { ACCEPTED_IMAGE_TYPES } from "../uploadLimits";
 
 type Status = "idle" | "loading" | "uploading" | "randomizing" | "deleting";
 type AuthStatus = "checking" | "idle" | "signing-in" | "signing-out";
@@ -95,7 +88,11 @@ export function App() {
     setMessage(`Uploading ${imageFiles.length} image${imageFiles.length === 1 ? "" : "s"}...`);
 
     try {
-      const uploaded = await uploadImages(imageFiles);
+      const uploaded = await uploadImages(imageFiles, (progress) => {
+        setMessage(
+          `Uploading ${progress.fileName} (${progress.fileIndex + 1}/${progress.fileCount}): ${formatBytes(progress.uploadedBytes)} of ${formatBytes(progress.totalBytes)}...`,
+        );
+      });
       const nextImages = await fetchImages();
 
       setImages(nextImages);
@@ -195,26 +192,9 @@ export function App() {
   }
 
   function validateFiles(files: File[]) {
-    if (files.length > MAX_UPLOAD_FILES) {
-      setError(`Upload at most ${MAX_UPLOAD_FILES} images at once.`);
-      return [];
-    }
-
-    const totalBytes = files.reduce((total, file) => total + file.size, 0);
-
-    if (totalBytes > MAX_UPLOAD_TOTAL_BYTES) {
-      setError(`Combined upload size is too large. Keep each batch under ${MAX_UPLOAD_TOTAL_SIZE_LABEL}.`);
-      return [];
-    }
-
     for (const file of files) {
       if (!isAcceptedImageType(file.type)) {
         setError(`${file.name} is not a supported image type.`);
-        return [];
-      }
-
-      if (file.size > MAX_UPLOAD_BYTES) {
-        setError(`${file.name} is larger than ${MAX_UPLOAD_SIZE_LABEL}.`);
         return [];
       }
     }
@@ -417,7 +397,7 @@ export function App() {
             <UploadCloud size={24} />
             <div>
               <strong>{authenticated ? (status === "uploading" ? "Uploading..." : "Drop images") : "Upload locked"}</strong>
-              <span>{authenticated ? `PNG, JPEG, WebP, AVIF, GIF. ${MAX_UPLOAD_FILES} files, ${MAX_UPLOAD_SIZE_LABEL} each.` : "Sign in first"}</span>
+              <span>{authenticated ? "PNG, JPEG, WebP, AVIF, GIF" : "Sign in first"}</span>
             </div>
           </div>
 

@@ -1,13 +1,7 @@
-import {
-  ACCEPTED_IMAGE_TYPES,
-  MAX_UPLOAD_BODY_BYTES,
-  MAX_UPLOAD_BYTES,
-  MAX_UPLOAD_FILES,
-  MAX_UPLOAD_SIZE_LABEL,
-  MAX_UPLOAD_TOTAL_BYTES,
-} from "./uploadLimits";
+import { ACCEPTED_IMAGE_TYPES, selectChunkedUploadPartSize } from "./uploadLimits";
 
 const IMAGE_PREFIX = "images/";
+const MULTIPART_UPLOAD_PREFIX = "multipart-uploads/";
 const MAX_LOGIN_BODY_BYTES = 2048;
 const LOGIN_ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
 const MAX_LOGIN_ATTEMPTS = 8;
@@ -16,6 +10,7 @@ const MIN_AUTH_SECRET_LENGTH = 32;
 const SESSION_COOKIE = "neuro_gallery_session";
 const SESSION_TTL_SECONDS = 60 * 60 * 12;
 const ALLOWED_TYPES = new Set<string>(ACCEPTED_IMAGE_TYPES);
+const ILLEGAL_FILENAME_CHARACTERS = /[\x00-\x1f\x7f<>:"/\\|?*]+/g;
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 const EXTENSIONS_BY_TYPE = new Map([
   ["image/avif", ".avif"],
@@ -44,6 +39,25 @@ interface ImageRecord {
 type JsonValue = Record<string, unknown> | unknown[];
 type LoginPayload = {
   password?: unknown;
+};
+type MultipartStartPayload = {
+  contentType?: unknown;
+  name?: unknown;
+  size?: unknown;
+};
+type MultipartCompletePayload = {
+  parts?: unknown;
+  uploadId?: unknown;
+};
+type MultipartUploadState = {
+  contentType: string;
+  id: string;
+  key: string;
+  name: string;
+  partSize: number;
+  size: number;
+  uploadedAt: string;
+  uploadId: string;
 };
 type R2ListWithMetadataOptions = R2ListOptions & {
   include?: ("customMetadata" | "httpMetadata")[];
@@ -85,6 +99,38 @@ export default {
         return handleLogout(request);
       }
 
+      if (url.pathname === "/api/uploads/multipart" && request.method === "POST") {
+        const guard = await mutationGuard(request, env);
+
+        if (guard) {
+          return guard;
+        }
+
+        return handleMultipartStart(request, env);
+      }
+
+      const multipartRoute = parseMultipartRoute(url.pathname);
+
+      if (multipartRoute) {
+        const guard = await mutationGuard(request, env);
+
+        if (guard) {
+          return guard;
+        }
+
+        if (multipartRoute.action === "part" && request.method === "PUT") {
+          return handleMultipartPart(request, env, multipartRoute.id, multipartRoute.partNumber);
+        }
+
+        if (multipartRoute.action === "complete" && request.method === "POST") {
+          return handleMultipartComplete(request, env, multipartRoute.id);
+        }
+
+        if (multipartRoute.action === "upload" && request.method === "DELETE") {
+          return handleMultipartAbort(request, env, multipartRoute.id);
+        }
+      }
+
       if (url.pathname === "/random" || url.pathname === "/api/random") {
         return handleRandom(request, env);
       }
@@ -95,12 +141,10 @@ export default {
         }
 
         if (request.method === "POST") {
-          if (!isTrustedOrigin(request)) {
-            return forbiddenOrigin();
-          }
+          const guard = await mutationGuard(request, env);
 
-          if (!(await isAuthenticated(request, env))) {
-            return authRequired();
+          if (guard) {
+            return guard;
           }
 
           return handleUpload(request, env);
@@ -115,12 +159,10 @@ export default {
         }
 
         if (request.method === "DELETE") {
-          if (!isTrustedOrigin(request)) {
-            return forbiddenOrigin();
-          }
+          const guard = await mutationGuard(request, env);
 
-          if (!(await isAuthenticated(request, env))) {
-            return authRequired();
+          if (guard) {
+            return guard;
           }
 
           return handleDelete(id, env);
@@ -129,6 +171,10 @@ export default {
 
       return json({ error: "Not found" }, 404);
     } catch (error) {
+      if (error instanceof UploadHttpError) {
+        return json({ error: error.message }, error.status);
+      }
+
       const message = error instanceof Error ? error.message : "Unknown error";
       return json({ error: message }, 500);
     }
@@ -189,10 +235,6 @@ async function handleList(env: Env): Promise<Response> {
 }
 
 async function handleUpload(request: Request, env: Env): Promise<Response> {
-  if (requestBodyTooLarge(request, MAX_UPLOAD_BODY_BYTES)) {
-    return json({ error: "Upload request is too large." }, 413);
-  }
-
   const form = await request.formData();
   const values = [...form.getAll("images"), ...form.getAll("image")] as unknown[];
   const files = values.filter(isUploadFile);
@@ -201,31 +243,18 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     return json({ error: "Upload at least one image file." }, 400);
   }
 
-  if (files.length > MAX_UPLOAD_FILES) {
-    return json({ error: `Upload at most ${MAX_UPLOAD_FILES} images at once.` }, 413);
-  }
-
-  const totalUploadBytes = files.reduce((total, file) => total + file.size, 0);
-
-  if (totalUploadBytes > MAX_UPLOAD_TOTAL_BYTES) {
-    return json({ error: "Combined upload size is too large." }, 413);
-  }
-
   const uploaded: ImageRecord[] = [];
 
   for (const file of files) {
-    if (file.size > MAX_UPLOAD_BYTES) {
-      return json({ error: `${file.name} is larger than ${MAX_UPLOAD_SIZE_LABEL}.` }, 413);
-    }
-
     const bytes = new Uint8Array(await file.arrayBuffer());
     const contentType = detectImageContentType(bytes);
+    const cleanName = sanitizeUploadedFileName(file.name, contentType || file.type);
 
     if (!contentType || !ALLOWED_TYPES.has(contentType)) {
-      return json({ error: `${file.name} is not a supported image type.` }, 415);
+      return json({ error: `${cleanName} is not a supported image type.` }, 415);
     }
 
-    const id = createImageId(file, contentType);
+    const id = createImageId(cleanName, contentType);
     const key = toStorageKey(id);
     const uploadedAt = new Date().toISOString();
 
@@ -234,14 +263,14 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
         contentType,
       },
       customMetadata: {
-        name: file.name,
+        name: cleanName,
         uploadedAt,
       },
     });
 
     uploaded.push({
       id,
-      name: file.name,
+      name: cleanName,
       size: file.size,
       uploadedAt,
       contentType,
@@ -250,6 +279,191 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
   }
 
   return json({ uploaded, count: uploaded.length }, 201);
+}
+
+async function handleMultipartStart(request: Request, env: Env): Promise<Response> {
+  const payload = (await request.json().catch(() => ({}))) as MultipartStartPayload;
+
+  if (typeof payload.name !== "string" || !payload.name.trim()) {
+    return json({ error: "Upload filename is required." }, 400);
+  }
+
+  if (typeof payload.contentType !== "string" || !ALLOWED_TYPES.has(payload.contentType)) {
+    return json({ error: "Unsupported image type." }, 415);
+  }
+
+  if (typeof payload.size !== "number" || !Number.isFinite(payload.size) || payload.size <= 0) {
+    return json({ error: "Upload size is invalid." }, 400);
+  }
+
+  const cleanName = sanitizeUploadedFileName(payload.name, payload.contentType);
+  const id = createImageId(cleanName, payload.contentType);
+  const key = toStorageKey(id);
+  const uploadedAt = new Date().toISOString();
+  const partSize = selectChunkedUploadPartSize(payload.size);
+  const upload = await env.IMAGES.createMultipartUpload(key, {
+    httpMetadata: {
+      contentType: payload.contentType,
+    },
+    customMetadata: {
+      name: cleanName,
+      uploadedAt,
+    },
+  });
+  const state: MultipartUploadState = {
+    contentType: payload.contentType,
+    id,
+    key,
+    name: cleanName,
+    partSize,
+    size: payload.size,
+    uploadedAt,
+    uploadId: upload.uploadId,
+  };
+
+  try {
+    await env.IMAGES.put(toMultipartStateKey(id), JSON.stringify(state), {
+      httpMetadata: {
+        contentType: "application/json; charset=utf-8",
+      },
+    });
+  } catch (error) {
+    await upload.abort().catch(() => undefined);
+    throw error;
+  }
+
+  return json({
+    id,
+    uploadId: upload.uploadId,
+    partSize,
+    name: cleanName,
+    size: payload.size,
+    uploadedAt,
+    contentType: payload.contentType,
+    url: `/api/images/${encodeURIComponent(id)}`,
+  });
+}
+
+async function handleMultipartPart(request: Request, env: Env, id: string, partNumber: number): Promise<Response> {
+  if (!isValidImageId(id)) {
+    return json({ error: "Invalid upload id." }, 400);
+  }
+
+  if (!Number.isInteger(partNumber) || partNumber < 1) {
+    return json({ error: "Invalid upload part number." }, 400);
+  }
+
+  const uploadId = new URL(request.url).searchParams.get("uploadId");
+  const state = await getMultipartState(env, id);
+
+  if (!state) {
+    return json({ error: "Multipart upload was not found." }, 404);
+  }
+
+  if (!uploadId || uploadId !== state.uploadId) {
+    return json({ error: "Multipart upload id is invalid." }, 400);
+  }
+
+  if (!request.body) {
+    return json({ error: "Upload part is empty." }, 400);
+  }
+
+  const upload = env.IMAGES.resumeMultipartUpload(state.key, state.uploadId);
+  const part =
+    partNumber === 1
+      ? await uploadFirstMultipartPart(request, env, upload, state, partNumber)
+      : await upload.uploadPart(partNumber, request.body);
+
+  return json({ part });
+}
+
+async function uploadFirstMultipartPart(
+  request: Request,
+  env: Env,
+  upload: R2MultipartUpload,
+  state: MultipartUploadState,
+  partNumber: number,
+): Promise<R2UploadedPart> {
+  const bytes = new Uint8Array(await request.arrayBuffer());
+  const contentType = detectImageContentType(bytes);
+
+  if (!contentType || !ALLOWED_TYPES.has(contentType)) {
+    await upload.abort().catch(() => undefined);
+    await removeMultipartState(env, state);
+    throw new UploadHttpError(`${state.name} is not a supported image type.`, 415);
+  }
+
+  if (contentType !== state.contentType) {
+    await upload.abort().catch(() => undefined);
+    await removeMultipartState(env, state);
+    throw new UploadHttpError(`${state.name} does not match its detected image type.`, 415);
+  }
+
+  return upload.uploadPart(partNumber, bytes);
+}
+
+async function handleMultipartComplete(request: Request, env: Env, id: string): Promise<Response> {
+  if (!isValidImageId(id)) {
+    return json({ error: "Invalid upload id." }, 400);
+  }
+
+  const payload = (await request.json().catch(() => ({}))) as MultipartCompletePayload;
+  const state = await getMultipartState(env, id);
+
+  if (!state) {
+    return json({ error: "Multipart upload was not found." }, 404);
+  }
+
+  if (payload.uploadId !== state.uploadId) {
+    return json({ error: "Multipart upload id is invalid." }, 400);
+  }
+
+  const parts = parseUploadedParts(payload.parts);
+
+  if (!parts.length || !partsMatchUpload(parts, state)) {
+    return json({ error: "Upload has no completed parts." }, 400);
+  }
+
+  const object = await env.IMAGES.resumeMultipartUpload(state.key, state.uploadId).complete(parts);
+
+  await env.IMAGES.delete(toMultipartStateKey(id));
+
+  return json({
+    image: {
+      id: state.id,
+      name: state.name,
+      size: object.size || state.size,
+      uploadedAt: state.uploadedAt,
+      contentType: state.contentType,
+      url: `/api/images/${encodeURIComponent(state.id)}`,
+    },
+  });
+}
+
+async function handleMultipartAbort(request: Request, env: Env, id: string): Promise<Response> {
+  if (!isValidImageId(id)) {
+    return json({ error: "Invalid upload id." }, 400);
+  }
+
+  const uploadId = new URL(request.url).searchParams.get("uploadId");
+  const state = await getMultipartState(env, id);
+
+  if (!state) {
+    return json({ ok: true });
+  }
+
+  if (uploadId && uploadId !== state.uploadId) {
+    return json({ error: "Multipart upload id is invalid." }, 400);
+  }
+
+  await env.IMAGES.resumeMultipartUpload(state.key, state.uploadId).abort().catch(() => undefined);
+  await env.IMAGES.delete(toMultipartStateKey(id));
+
+  return json({ ok: true });
+}
+
+async function removeMultipartState(env: Env, state: MultipartUploadState): Promise<void> {
+  await env.IMAGES.delete(toMultipartStateKey(state.id));
 }
 
 async function handleImage(id: string, env: Env, headOnly = false): Promise<Response> {
@@ -343,10 +557,10 @@ function toImageRecord(object: R2Object): ImageRecord {
   };
 }
 
-function createImageId(file: UploadFile, contentType: string): string {
+function createImageId(fileName: string, contentType: string): string {
   const extension = extensionFromContentType(contentType);
   const random = crypto.randomUUID().slice(0, 8);
-  const stem = sanitizeName(file.name.replace(/\.[^.]+$/, ""));
+  const stem = sanitizeIdStem(fileName.replace(/\.[^.]+$/, ""));
 
   return `${Date.now()}-${random}-${stem}${extension}`;
 }
@@ -355,7 +569,19 @@ function extensionFromContentType(contentType: string): string {
   return EXTENSIONS_BY_TYPE.get(contentType) || ".img";
 }
 
-function sanitizeName(name: string): string {
+function sanitizeUploadedFileName(fileName: string, contentType: string): string {
+  const extension = extensionFromContentType(contentType);
+  const stem = fileName.replace(/\.[^.]+$/, "");
+  const cleanStem = removeIllegalFilenameCharacters(stem).replace(/\s+/g, " ").trim().slice(0, 96) || "upload";
+
+  return `${cleanStem}${extension}`;
+}
+
+function removeIllegalFilenameCharacters(value: string): string {
+  return value.replace(ILLEGAL_FILENAME_CHARACTERS, "").replace(/\.+$/g, "");
+}
+
+function sanitizeIdStem(name: string): string {
   return (
     name
       .toLowerCase()
@@ -374,6 +600,10 @@ function readableNameFromId(id: string): string {
 
 function toStorageKey(id: string): string {
   return `${IMAGE_PREFIX}${id}`;
+}
+
+function toMultipartStateKey(id: string): string {
+  return `${MULTIPART_UPLOAD_PREFIX}${id}.json`;
 }
 
 function isValidImageId(id: string): boolean {
@@ -400,6 +630,18 @@ function isUploadFile(value: unknown): value is UploadFile {
 
 function authRequired(): Response {
   return json({ error: "Sign in before changing images." }, 401);
+}
+
+async function mutationGuard(request: Request, env: Env): Promise<Response | null> {
+  if (!isTrustedOrigin(request)) {
+    return forbiddenOrigin();
+  }
+
+  if (!(await isAuthenticated(request, env))) {
+    return authRequired();
+  }
+
+  return null;
 }
 
 function forbiddenOrigin(): Response {
@@ -561,6 +803,86 @@ function clearLoginAttempts(key: string): void {
   loginAttempts.delete(key);
 }
 
+async function getMultipartState(env: Env, id: string): Promise<MultipartUploadState | null> {
+  const object = await env.IMAGES.get(toMultipartStateKey(id));
+
+  if (!object) {
+    return null;
+  }
+
+  try {
+    return (await object.json()) as MultipartUploadState;
+  } catch {
+    return null;
+  }
+}
+
+function parseUploadedParts(value: unknown): R2UploadedPart[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((part) => {
+      if (
+        typeof part !== "object" ||
+        part === null ||
+        !("partNumber" in part) ||
+        !("etag" in part) ||
+        typeof part.partNumber !== "number" ||
+        !Number.isInteger(part.partNumber) ||
+        part.partNumber < 1 ||
+        typeof part.etag !== "string" ||
+        !part.etag
+      ) {
+        return null;
+      }
+
+      return {
+        partNumber: part.partNumber,
+        etag: part.etag,
+      };
+    })
+    .filter((part): part is R2UploadedPart => Boolean(part))
+    .sort((a, b) => a.partNumber - b.partNumber);
+}
+
+function partsMatchUpload(parts: R2UploadedPart[], state: MultipartUploadState): boolean {
+  const expectedPartCount = Math.ceil(state.size / state.partSize);
+
+  return parts.length === expectedPartCount && parts.every((part, index) => part.partNumber === index + 1);
+}
+
+function parseMultipartRoute(pathname: string):
+  | { action: "complete"; id: string }
+  | { action: "part"; id: string; partNumber: number }
+  | { action: "upload"; id: string }
+  | null {
+  const uploadMatch = pathname.match(/^\/api\/uploads\/multipart\/([^/]+)$/);
+
+  if (uploadMatch?.[1]) {
+    return { action: "upload", id: decodeURIComponent(uploadMatch[1]) };
+  }
+
+  const partMatch = pathname.match(/^\/api\/uploads\/multipart\/([^/]+)\/parts\/(\d+)$/);
+
+  if (partMatch?.[1] && partMatch[2]) {
+    return {
+      action: "part",
+      id: decodeURIComponent(partMatch[1]),
+      partNumber: Number.parseInt(partMatch[2], 10),
+    };
+  }
+
+  const completeMatch = pathname.match(/^\/api\/uploads\/multipart\/([^/]+)\/complete$/);
+
+  if (completeMatch?.[1]) {
+    return { action: "complete", id: decodeURIComponent(completeMatch[1]) };
+  }
+
+  return null;
+}
+
 function requestBodyTooLarge(request: Request, maxBytes: number): boolean {
   const contentLength = request.headers.get("content-length");
 
@@ -626,6 +948,12 @@ function json(data: JsonValue, status = 200, headers?: HeadersInit): Response {
   });
 }
 
+class UploadHttpError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+  }
+}
+
 function preflightHeaders(request: Request): Record<string, string> {
   if (!isTrustedOrigin(request)) {
     return {};
@@ -636,7 +964,7 @@ function preflightHeaders(request: Request): Record<string, string> {
   return {
     "access-control-allow-origin": origin,
     "access-control-allow-credentials": "true",
-    "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
+    "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
     "access-control-allow-headers": "content-type",
   };
 }

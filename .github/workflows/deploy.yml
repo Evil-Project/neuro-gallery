@@ -1,0 +1,100 @@
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy Worker
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit dependencies
+        run: npm audit --omit=optional
+
+      - name: Verify Cloudflare secrets
+        run: |
+          test -n "$CLOUDFLARE_ACCOUNT_ID" || (echo "Missing CLOUDFLARE_ACCOUNT_ID GitHub secret" && exit 1)
+          test -n "$CLOUDFLARE_API_TOKEN" || (echo "Missing CLOUDFLARE_API_TOKEN GitHub secret" && exit 1)
+          test -n "$UPLOAD_PASSWORD" || (echo "Missing UPLOAD_PASSWORD GitHub secret" && exit 1)
+          test -n "$AUTH_SECRET" || (echo "Missing AUTH_SECRET GitHub secret" && exit 1)
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          UPLOAD_PASSWORD: ${{ secrets.UPLOAD_PASSWORD }}
+          AUTH_SECRET: ${{ secrets.AUTH_SECRET }}
+
+      - name: Create R2 buckets
+        run: |
+          create_bucket() {
+            bucket="$1"
+
+            if npx wrangler r2 bucket info "$bucket" >/dev/null 2>&1; then
+              echo "R2 bucket already exists: $bucket"
+            else
+              echo "Creating R2 bucket: $bucket"
+              npx wrangler r2 bucket create "$bucket"
+            fi
+          }
+
+          create_bucket "neuro-gallery-images"
+          create_bucket "neuro-gallery-images-dev"
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      - name: Build
+        run: npm run build
+
+      - name: Write Worker secrets file
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+
+          fs.writeFileSync(
+            process.env.WORKER_SECRETS_FILE,
+            JSON.stringify({
+              UPLOAD_PASSWORD: process.env.UPLOAD_PASSWORD,
+              AUTH_SECRET: process.env.AUTH_SECRET,
+            }),
+          );
+          NODE
+        env:
+          WORKER_SECRETS_FILE: ${{ runner.temp }}/worker-secrets.json
+          UPLOAD_PASSWORD: ${{ secrets.UPLOAD_PASSWORD }}
+          AUTH_SECRET: ${{ secrets.AUTH_SECRET }}
+
+      - name: Deploy
+        run: npx wrangler deploy --secrets-file "$WORKER_SECRETS_FILE"
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          WORKER_SECRETS_FILE: ${{ runner.temp }}/worker-secrets.json
+
+      - name: Remove Worker secrets file
+        if: always()
+        run: rm -f "$WORKER_SECRETS_FILE"
+        env:
+          WORKER_SECRETS_FILE: ${{ runner.temp }}/worker-secrets.json

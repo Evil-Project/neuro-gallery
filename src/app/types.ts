@@ -17,6 +17,28 @@ export interface UploadResponse {
   uploaded: GalleryImage[];
 }
 
+export interface MultipartUploadStartResponse {
+  id: string;
+  uploadId: string;
+  partSize: number;
+  name: string;
+  size: number;
+  contentType: string;
+  uploadedAt: string;
+  url: string;
+}
+
+export interface MultipartUploadPartResponse {
+  part: {
+    partNumber: number;
+    etag: string;
+  };
+}
+
+export interface MultipartUploadCompleteResponse {
+  image: GalleryImage;
+}
+
 export interface RandomResponse {
   image: GalleryImage;
 }
