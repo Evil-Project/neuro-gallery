@@ -10,6 +10,10 @@ import type {
   UploadResponse,
 } from "./types";
 
+const UPLOAD_RETRY_COUNT = 5;
+const RETRY_BASE_DELAY_MS = 350;
+const RETRYABLE_UPLOAD_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
+
 export interface UploadProgress {
   fileIndex: number;
   fileCount: number;
@@ -18,16 +22,43 @@ export interface UploadProgress {
   totalBytes: number;
 }
 
+class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 async function requestJson<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
   const response = await fetch(input, init);
   const text = await response.text().catch(() => "");
   const payload = parseJson(text);
 
   if (!response.ok) {
-    throw new Error(errorMessage(response, payload, text));
+    throw new ApiError(errorMessage(response, payload, text), response.status);
   }
 
   return payload as T;
+}
+
+async function requestUploadJson<T>(input: RequestInfo, init?: RequestInit): Promise<T> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= UPLOAD_RETRY_COUNT; attempt += 1) {
+    try {
+      return await requestJson<T>(input, init);
+    } catch (error) {
+      lastError = error;
+
+      if (attempt === UPLOAD_RETRY_COUNT || !isRetryableUploadError(error)) {
+        throw error;
+      }
+
+      await delay(retryDelay(attempt));
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Upload failed.");
 }
 
 function parseJson(text: string): unknown {
@@ -70,6 +101,22 @@ function isErrorPayload(payload: unknown): payload is { error: string } {
   );
 }
 
+function isRetryableUploadError(error: unknown) {
+  if (error instanceof ApiError) {
+    return RETRYABLE_UPLOAD_STATUSES.has(error.status);
+  }
+
+  return error instanceof TypeError;
+}
+
+function retryDelay(attempt: number) {
+  return RETRY_BASE_DELAY_MS * 2 ** attempt;
+}
+
+function delay(milliseconds: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
 export async function fetchImages(): Promise<GalleryImage[]> {
   const payload = await requestJson<ImagesResponse>("/api/images");
   return payload.images;
@@ -105,7 +152,7 @@ async function uploadSingleImage(file: File): Promise<GalleryImage> {
 
   body.append("images", file);
 
-  const payload = await requestJson<UploadResponse>("/api/images", {
+  const payload = await requestUploadJson<UploadResponse>("/api/images", {
     method: "POST",
     body,
     credentials: "same-origin",
@@ -124,7 +171,7 @@ async function uploadLargeImage(file: File, onProgress?: (uploadedBytes: number)
   let upload: MultipartUploadStartResponse | null = null;
 
   try {
-    upload = await requestJson<MultipartUploadStartResponse>("/api/uploads/multipart", {
+    upload = await requestUploadJson<MultipartUploadStartResponse>("/api/uploads/multipart", {
       method: "POST",
       credentials: "same-origin",
       headers: {
@@ -151,7 +198,7 @@ async function uploadLargeImage(file: File, onProgress?: (uploadedBytes: number)
       onProgress?.(end);
     }
 
-    const completed = await requestJson<MultipartUploadCompleteResponse>(
+    const completed = await requestUploadJson<MultipartUploadCompleteResponse>(
       `/api/uploads/multipart/${encodeURIComponent(upload.id)}/complete`,
       {
         method: "POST",
@@ -177,7 +224,7 @@ async function uploadLargeImage(file: File, onProgress?: (uploadedBytes: number)
 }
 
 async function uploadMultipartPart(upload: MultipartUploadStartResponse, partNumber: number, chunk: Blob): Promise<MultipartUploadPartResponse["part"]> {
-  const payload = await requestJson<MultipartUploadPartResponse>(
+  const payload = await requestUploadJson<MultipartUploadPartResponse>(
     `/api/uploads/multipart/${encodeURIComponent(upload.id)}/parts/${partNumber}?uploadId=${encodeURIComponent(upload.uploadId)}`,
     {
       method: "PUT",

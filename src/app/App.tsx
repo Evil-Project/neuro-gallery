@@ -23,6 +23,7 @@ type AuthStatus = "checking" | "idle" | "signing-in" | "signing-out";
 
 export function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const selectAllRef = useRef<HTMLInputElement>(null);
   const [images, setImages] = useState<GalleryImage[]>([]);
   const [randomImage, setRandomImage] = useState<GalleryImage | null>(null);
   const [status, setStatus] = useState<Status>("loading");
@@ -33,8 +34,11 @@ export function App() {
   const [authenticated, setAuthenticated] = useState(false);
   const [authStatus, setAuthStatus] = useState<AuthStatus>("checking");
   const [password, setPassword] = useState("");
+  const [selectedImageIds, setSelectedImageIds] = useState<string[]>([]);
 
-  const latestImages = useMemo(() => images.slice(0, 8), [images]);
+  const selectedImageIdSet = useMemo(() => new Set(selectedImageIds), [selectedImageIds]);
+  const selectedCount = selectedImageIds.length;
+  const allImagesSelected = images.length > 0 && selectedCount === images.length;
   const randomUrl = randomImage ? new URL(randomImage.url, window.location.origin).toString() : "";
   const redirectUrl = new URL("/random", window.location.origin).toString();
 
@@ -69,6 +73,21 @@ export function App() {
       mounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    const imageIds = new Set(images.map((image) => image.id));
+
+    setSelectedImageIds((current) => {
+      const next = current.filter((id) => imageIds.has(id));
+      return next.length === current.length ? current : next;
+    });
+  }, [images]);
+
+  useEffect(() => {
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate = selectedCount > 0 && !allImagesSelected;
+    }
+  }, [allImagesSelected, selectedCount]);
 
   async function handleUpload(files: File[]) {
     if (!authenticated) {
@@ -127,6 +146,63 @@ export function App() {
     }
   }
 
+  function toggleImageSelection(id: string) {
+    setSelectedImageIds((current) => (current.includes(id) ? current.filter((selectedId) => selectedId !== id) : [...current, id]));
+  }
+
+  function toggleAllImages(checked: boolean) {
+    setSelectedImageIds(checked ? images.map((image) => image.id) : []);
+  }
+
+  async function removeSelectedImages() {
+    if (!authenticated) {
+      setError("Sign in to remove images.");
+      return;
+    }
+
+    const visibleIds = new Set(images.map((image) => image.id));
+    const idsToDelete = selectedImageIds.filter((id) => visibleIds.has(id));
+
+    if (!idsToDelete.length) {
+      setSelectedImageIds([]);
+      return;
+    }
+
+    setStatus("deleting");
+    setError("");
+
+    try {
+      const results = await Promise.allSettled(
+        idsToDelete.map(async (id) => {
+          await deleteImage(id);
+          return id;
+        }),
+      );
+      const deletedIds = results.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
+      const failedCount = results.length - deletedIds.length;
+      const deletedIdSet = new Set(deletedIds);
+
+      if (deletedIds.length) {
+        const nextImages = images.filter((image) => !deletedIdSet.has(image.id));
+
+        setImages(nextImages);
+        setSelectedImageIds((current) => current.filter((id) => !deletedIdSet.has(id)));
+        setRandomImage((current) => (current && deletedIdSet.has(current.id) ? nextImages[0] ?? null : current));
+      }
+
+      if (failedCount) {
+        setError(`${failedCount} selected image${failedCount === 1 ? "" : "s"} could not be deleted.`);
+        setMessage(`${deletedIds.length} deleted, ${failedCount} failed.`);
+      } else {
+        setMessage(`${deletedIds.length} selected image${deletedIds.length === 1 ? "" : "s"} removed from the random pool.`);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Delete failed.");
+    } finally {
+      setStatus("idle");
+    }
+  }
+
   async function removeImage(id: string) {
     if (!authenticated) {
       setError("Sign in to remove images.");
@@ -140,6 +216,7 @@ export function App() {
       await deleteImage(id);
       const nextImages = images.filter((image) => image.id !== id);
       setImages(nextImages);
+      setSelectedImageIds((current) => current.filter((selectedId) => selectedId !== id));
       setRandomImage((current) => (current?.id === id ? nextImages[0] ?? null : current));
       setMessage("Image removed from the random pool.");
     } catch (err) {
@@ -402,14 +479,51 @@ export function App() {
           </div>
 
           <div className="gallery-header">
-            <span>Latest uploads</span>
-            <small>{status === "loading" ? "Loading" : `${images.length} total`}</small>
+            <span>Uploads</span>
+            <small>{status === "loading" ? "Loading" : selectedCount ? `${selectedCount} selected` : `${images.length} total`}</small>
+          </div>
+
+          <div className="selection-toolbar">
+            <label className="selection-control select-all-control">
+              <input
+                ref={selectAllRef}
+                type="checkbox"
+                checked={allImagesSelected}
+                onChange={(event) => toggleAllImages(event.target.checked)}
+                disabled={!images.length || status === "deleting"}
+              />
+              <span className="selection-box" aria-hidden="true" />
+              <span className="selection-text">
+                <strong>Select all</strong>
+                <small>{images.length ? `${images.length} available` : "No uploads"}</small>
+              </span>
+            </label>
+            <button
+              className="bulk-delete-button"
+              type="button"
+              onClick={removeSelectedImages}
+              disabled={!authenticated || status === "deleting" || selectedCount === 0}
+              title={authenticated ? "Delete selected images" : "Sign in to delete"}
+            >
+              {status === "deleting" ? <Loader2 className="spin" size={16} /> : <Trash2 size={16} />}
+              Delete selected
+            </button>
           </div>
 
           <div className="image-list" aria-live="polite">
-            {latestImages.length ? (
-              latestImages.map((image) => (
+            {images.length ? (
+              images.map((image) => (
                 <article className="image-row" key={image.id}>
+                  <label className="selection-control row-select">
+                    <input
+                      type="checkbox"
+                      checked={selectedImageIdSet.has(image.id)}
+                      onChange={() => toggleImageSelection(image.id)}
+                      disabled={status === "deleting"}
+                      aria-label={`Select ${image.name}`}
+                    />
+                    <span className="selection-box" aria-hidden="true" />
+                  </label>
                   <button
                     className="thumb-button"
                     type="button"
