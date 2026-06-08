@@ -21,7 +21,7 @@ type Status = "idle" | "loading" | "uploading" | "randomizing" | "deleting";
 type AuthStatus = "checking" | "idle" | "signing-in" | "signing-out";
 
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
-const ACCEPTED_TYPES = ["image/avif", "image/gif", "image/jpeg", "image/png", "image/svg+xml", "image/webp"];
+const ACCEPTED_TYPES = ["image/avif", "image/gif", "image/jpeg", "image/png", "image/webp"];
 
 export function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -402,7 +402,7 @@ export function App() {
             <UploadCloud size={24} />
             <div>
               <strong>{authenticated ? (status === "uploading" ? "Uploading..." : "Drop images") : "Upload locked"}</strong>
-              <span>{authenticated ? "PNG, JPEG, WebP, AVIF, GIF, SVG up to 10 MB" : "Sign in first"}</span>
+              <span>{authenticated ? "PNG, JPEG, WebP, AVIF, GIF up to 10 MB" : "Sign in first"}</span>
             </div>
           </div>
 

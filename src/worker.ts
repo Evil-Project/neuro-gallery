@@ -1,5 +1,12 @@
 const IMAGE_PREFIX = "images/";
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const MAX_UPLOAD_FILES = 8;
+const MAX_UPLOAD_BODY_BYTES = MAX_UPLOAD_BYTES * MAX_UPLOAD_FILES;
+const MAX_LOGIN_BODY_BYTES = 2048;
+const LOGIN_ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
+const MAX_LOGIN_ATTEMPTS = 8;
+const MIN_UPLOAD_PASSWORD_LENGTH = 12;
+const MIN_AUTH_SECRET_LENGTH = 32;
 const SESSION_COOKIE = "neuro_gallery_session";
 const SESSION_TTL_SECONDS = 60 * 60 * 12;
 const ALLOWED_TYPES = new Set([
@@ -7,8 +14,15 @@ const ALLOWED_TYPES = new Set([
   "image/gif",
   "image/jpeg",
   "image/png",
-  "image/svg+xml",
   "image/webp",
+]);
+const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+const EXTENSIONS_BY_TYPE = new Map([
+  ["image/avif", ".avif"],
+  ["image/gif", ".gif"],
+  ["image/jpeg", ".jpg"],
+  ["image/png", ".png"],
+  ["image/webp", ".webp"],
 ]);
 
 interface Env {
@@ -35,6 +49,7 @@ type R2ListWithMetadataOptions = R2ListOptions & {
   include?: ("customMetadata" | "httpMetadata")[];
 };
 type UploadFile = File & {
+  arrayBuffer(): Promise<ArrayBuffer>;
   name: string;
   size: number;
   type: string;
@@ -46,7 +61,7 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders() });
+      return new Response(null, { status: 204, headers: preflightHeaders(request) });
     }
 
     try {
@@ -55,10 +70,18 @@ export default {
       }
 
       if (url.pathname === "/api/auth/login" && request.method === "POST") {
+        if (!isTrustedOrigin(request)) {
+          return forbiddenOrigin();
+        }
+
         return handleLogin(request, env);
       }
 
       if (url.pathname === "/api/auth/logout" && request.method === "POST") {
+        if (!isTrustedOrigin(request)) {
+          return forbiddenOrigin();
+        }
+
         return handleLogout(request);
       }
 
@@ -72,6 +95,10 @@ export default {
         }
 
         if (request.method === "POST") {
+          if (!isTrustedOrigin(request)) {
+            return forbiddenOrigin();
+          }
+
           if (!(await isAuthenticated(request, env))) {
             return authRequired();
           }
@@ -88,6 +115,10 @@ export default {
         }
 
         if (request.method === "DELETE") {
+          if (!isTrustedOrigin(request)) {
+            return forbiddenOrigin();
+          }
+
           if (!(await isAuthenticated(request, env))) {
             return authRequired();
           }
@@ -113,12 +144,24 @@ async function handleLogin(request: Request, env: Env): Promise<Response> {
     return json({ error: "Upload authentication is not configured." }, 500);
   }
 
+  const loginKey = loginAttemptKey(request);
+
+  if (isLoginThrottled(loginKey)) {
+    return json({ error: "Too many login attempts. Try again later." }, 429);
+  }
+
+  if (requestBodyTooLarge(request, MAX_LOGIN_BODY_BYTES)) {
+    return json({ error: "Login request is too large." }, 413);
+  }
+
   const payload = (await request.json().catch(() => ({}))) as LoginPayload;
 
   if (typeof payload.password !== "string" || !constantTimeEqual(payload.password, env.UPLOAD_PASSWORD || "")) {
+    recordFailedLogin(loginKey);
     return json({ error: "Invalid upload password." }, 401);
   }
 
+  clearLoginAttempts(loginKey);
   const token = await createSessionToken(env);
 
   return json(
@@ -146,6 +189,10 @@ async function handleList(env: Env): Promise<Response> {
 }
 
 async function handleUpload(request: Request, env: Env): Promise<Response> {
+  if (requestBodyTooLarge(request, MAX_UPLOAD_BODY_BYTES)) {
+    return json({ error: "Upload request is too large." }, 413);
+  }
+
   const form = await request.formData();
   const values = [...form.getAll("images"), ...form.getAll("image")] as unknown[];
   const files = values.filter(isUploadFile);
@@ -154,24 +201,37 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
     return json({ error: "Upload at least one image file." }, 400);
   }
 
+  if (files.length > MAX_UPLOAD_FILES) {
+    return json({ error: `Upload at most ${MAX_UPLOAD_FILES} images at once.` }, 413);
+  }
+
+  const totalUploadBytes = files.reduce((total, file) => total + file.size, 0);
+
+  if (totalUploadBytes > MAX_UPLOAD_BODY_BYTES) {
+    return json({ error: "Combined upload size is too large." }, 413);
+  }
+
   const uploaded: ImageRecord[] = [];
 
   for (const file of files) {
-    if (!ALLOWED_TYPES.has(file.type)) {
-      return json({ error: `${file.name} is not a supported image type.` }, 415);
-    }
-
     if (file.size > MAX_UPLOAD_BYTES) {
       return json({ error: `${file.name} is larger than 10 MB.` }, 413);
     }
 
-    const id = createImageId(file);
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const contentType = detectImageContentType(bytes);
+
+    if (!contentType || !ALLOWED_TYPES.has(contentType)) {
+      return json({ error: `${file.name} is not a supported image type.` }, 415);
+    }
+
+    const id = createImageId(file, contentType);
     const key = toStorageKey(id);
     const uploadedAt = new Date().toISOString();
 
-    await env.IMAGES.put(key, file.stream(), {
+    await env.IMAGES.put(key, bytes, {
       httpMetadata: {
-        contentType: file.type,
+        contentType,
       },
       customMetadata: {
         name: file.name,
@@ -184,7 +244,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       name: file.name,
       size: file.size,
       uploadedAt,
-      contentType: file.type,
+      contentType,
       url: `/api/images/${encodeURIComponent(id)}`,
     });
   }
@@ -209,7 +269,8 @@ async function handleImage(id: string, env: Env, headOnly = false): Promise<Resp
   object.writeHttpMetadata(headers);
   headers.set("etag", object.httpEtag);
   headers.set("cache-control", "public, max-age=31536000, immutable");
-  headers.set("access-control-allow-origin", "*");
+  headers.set("content-security-policy", "default-src 'none'; sandbox");
+  headers.set("x-content-type-options", "nosniff");
 
   return new Response(headOnly ? null : object.body, { headers });
 }
@@ -237,7 +298,13 @@ async function handleRandom(request: Request, env: Env): Promise<Response> {
     return json({ image });
   }
 
-  return Response.redirect(new URL(image.url, request.url).toString(), 302);
+  return new Response(null, {
+    status: 302,
+    headers: {
+      "cache-control": "no-store",
+      location: new URL(image.url, request.url).toString(),
+    },
+  });
 }
 
 async function listImages(env: Env): Promise<ImageRecord[]> {
@@ -276,23 +343,16 @@ function toImageRecord(object: R2Object): ImageRecord {
   };
 }
 
-function createImageId(file: UploadFile): string {
-  const extension = extensionFromFile(file);
+function createImageId(file: UploadFile, contentType: string): string {
+  const extension = extensionFromContentType(contentType);
   const random = crypto.randomUUID().slice(0, 8);
   const stem = sanitizeName(file.name.replace(/\.[^.]+$/, ""));
 
   return `${Date.now()}-${random}-${stem}${extension}`;
 }
 
-function extensionFromFile(file: UploadFile): string {
-  const fromName = file.name.match(/\.[a-z0-9]+$/i)?.[0]?.toLowerCase();
-
-  if (fromName) {
-    return fromName;
-  }
-
-  const fromType = file.type.split("/")[1];
-  return fromType ? `.${fromType.replace("svg+xml", "svg")}` : ".img";
+function extensionFromContentType(contentType: string): string {
+  return EXTENSIONS_BY_TYPE.get(contentType) || ".img";
 }
 
 function sanitizeName(name: string): string {
@@ -327,10 +387,12 @@ function isUploadFile(value: unknown): value is UploadFile {
     "name" in value &&
     "size" in value &&
     "type" in value &&
+    "arrayBuffer" in value &&
     "stream" in value &&
     typeof value.name === "string" &&
     typeof value.size === "number" &&
     typeof value.type === "string" &&
+    typeof value.arrayBuffer === "function" &&
     typeof value.stream === "function" &&
     value.size > 0
   );
@@ -338,6 +400,10 @@ function isUploadFile(value: unknown): value is UploadFile {
 
 function authRequired(): Response {
   return json({ error: "Sign in before changing images." }, 401);
+}
+
+function forbiddenOrigin(): Response {
+  return json({ error: "Cross-origin mutation requests are not allowed." }, 403);
 }
 
 async function isAuthenticated(request: Request, env: Env): Promise<boolean> {
@@ -350,7 +416,12 @@ async function isAuthenticated(request: Request, env: Env): Promise<boolean> {
 }
 
 function isAuthConfigured(env: Env): boolean {
-  return Boolean(env.AUTH_SECRET && env.UPLOAD_PASSWORD);
+  return Boolean(
+    env.AUTH_SECRET &&
+      env.AUTH_SECRET.length >= MIN_AUTH_SECRET_LENGTH &&
+      env.UPLOAD_PASSWORD &&
+      env.UPLOAD_PASSWORD.length >= MIN_UPLOAD_PASSWORD_LENGTH,
+  );
 }
 
 async function createSessionToken(env: Env): Promise<string> {
@@ -366,7 +437,13 @@ async function createSessionToken(env: Env): Promise<string> {
 }
 
 async function verifySessionToken(token: string, env: Env): Promise<boolean> {
-  const [payload, signature] = token.split(".");
+  const parts = token.split(".");
+
+  if (parts.length !== 2) {
+    return false;
+  }
+
+  const [payload, signature] = parts;
 
   if (!payload || !signature) {
     return false;
@@ -402,7 +479,7 @@ async function sign(value: string, secret: string): Promise<string> {
 function serializeSessionCookie(value: string, request: Request, maxAge: number): string {
   const secure = new URL(request.url).protocol === "https:" ? "; Secure" : "";
 
-  return `${SESSION_COOKIE}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`;
+  return `${SESSION_COOKIE}=${value}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${maxAge}${secure}`;
 }
 
 function getCookie(cookieHeader: string, name: string): string | null {
@@ -445,20 +522,120 @@ function constantTimeEqual(left: string, right: string): boolean {
   return diff === 0;
 }
 
+function loginAttemptKey(request: Request): string {
+  return request.headers.get("cf-connecting-ip") || request.headers.get("x-forwarded-for") || "unknown";
+}
+
+function isLoginThrottled(key: string): boolean {
+  const attempt = loginAttempts.get(key);
+  const now = Date.now();
+
+  if (!attempt) {
+    return false;
+  }
+
+  if (attempt.resetAt <= now) {
+    loginAttempts.delete(key);
+    return false;
+  }
+
+  return attempt.count >= MAX_LOGIN_ATTEMPTS;
+}
+
+function recordFailedLogin(key: string): void {
+  const now = Date.now();
+  const attempt = loginAttempts.get(key);
+
+  if (!attempt || attempt.resetAt <= now) {
+    loginAttempts.set(key, {
+      count: 1,
+      resetAt: now + LOGIN_ATTEMPT_WINDOW_MS,
+    });
+    return;
+  }
+
+  attempt.count += 1;
+}
+
+function clearLoginAttempts(key: string): void {
+  loginAttempts.delete(key);
+}
+
+function requestBodyTooLarge(request: Request, maxBytes: number): boolean {
+  const contentLength = request.headers.get("content-length");
+
+  if (!contentLength) {
+    return false;
+  }
+
+  const parsed = Number.parseInt(contentLength, 10);
+  return Number.isFinite(parsed) && parsed > maxBytes;
+}
+
+function isTrustedOrigin(request: Request): boolean {
+  const origin = request.headers.get("origin");
+
+  if (!origin) {
+    return true;
+  }
+
+  return origin === new URL(request.url).origin;
+}
+
+function detectImageContentType(bytes: Uint8Array): string | null {
+  if (startsWith(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) {
+    return "image/png";
+  }
+
+  if (startsWith(bytes, [0xff, 0xd8, 0xff])) {
+    return "image/jpeg";
+  }
+
+  if (ascii(bytes, 0, 6) === "GIF87a" || ascii(bytes, 0, 6) === "GIF89a") {
+    return "image/gif";
+  }
+
+  if (ascii(bytes, 0, 4) === "RIFF" && ascii(bytes, 8, 4) === "WEBP") {
+    return "image/webp";
+  }
+
+  if (ascii(bytes, 4, 4) === "ftyp" && ascii(bytes, 8, 24).includes("avif")) {
+    return "image/avif";
+  }
+
+  return null;
+}
+
+function startsWith(bytes: Uint8Array, signature: number[]): boolean {
+  return signature.every((byte, index) => bytes[index] === byte);
+}
+
+function ascii(bytes: Uint8Array, offset: number, length: number): string {
+  return String.fromCharCode(...bytes.slice(offset, offset + length));
+}
+
 function json(data: JsonValue, status = 200, headers?: HeadersInit): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
-      "content-type": "application/json",
-      ...corsHeaders(),
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+      "x-content-type-options": "nosniff",
       ...Object.fromEntries(new Headers(headers).entries()),
     },
   });
 }
 
-function corsHeaders(): Record<string, string> {
+function preflightHeaders(request: Request): Record<string, string> {
+  if (!isTrustedOrigin(request)) {
+    return {};
+  }
+
+  const origin = request.headers.get("origin") || new URL(request.url).origin;
+
   return {
-    "access-control-allow-origin": "*",
+    "access-control-allow-origin": origin,
+    "access-control-allow-credentials": "true",
     "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
     "access-control-allow-headers": "content-type",
   };

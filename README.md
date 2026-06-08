@@ -28,8 +28,8 @@ A Cloudflare Worker image API with a React frontend. Users upload their own imag
 
 Uploads and deletes require two secrets:
 
-- `UPLOAD_PASSWORD`: the password entered in the frontend.
-- `AUTH_SECRET`: a long random string used to sign the HTTP-only session cookie.
+- `UPLOAD_PASSWORD`: the password entered in the frontend; use at least 12 characters.
+- `AUTH_SECRET`: a long random string used to sign the HTTP-only session cookie; use at least 32 characters.
 
 For local development:
 
@@ -38,6 +38,8 @@ cp .dev.vars.example .dev.vars
 ```
 
 Then edit `.dev.vars`.
+
+Uploads accept PNG, JPEG, WebP, AVIF, and GIF files up to 10 MB each. SVG uploads are intentionally rejected because same-origin SVG content can execute active scripts.
 
 ## Local development
 
