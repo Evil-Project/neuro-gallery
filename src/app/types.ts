@@ -17,6 +17,11 @@ export interface UploadResponse {
   uploaded: GalleryImage[];
 }
 
+export interface DeleteImagesResponse {
+  count: number;
+  deleted: string[];
+}
+
 export interface MultipartUploadStartResponse {
   id: string;
   uploadId: string;

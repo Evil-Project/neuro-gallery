@@ -1,6 +1,7 @@
 import { DEFAULT_CHUNKED_UPLOAD_PART_BYTES } from "../uploadLimits";
 import type {
   AuthSessionResponse,
+  DeleteImagesResponse,
   GalleryImage,
   ImagesResponse,
   MultipartUploadCompleteResponse,
@@ -259,6 +260,23 @@ export async function deleteImage(id: string): Promise<void> {
     method: "DELETE",
     credentials: "same-origin",
   });
+}
+
+export async function deleteImages(ids: string[]): Promise<string[]> {
+  if (ids.length === 0) {
+    return [];
+  }
+
+  const payload = await requestJson<DeleteImagesResponse>("/api/images", {
+    method: "DELETE",
+    credentials: "same-origin",
+    headers: {
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ ids }),
+  });
+
+  return payload.deleted;
 }
 
 export async function fetchAuthSession(): Promise<boolean> {

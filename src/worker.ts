@@ -7,6 +7,9 @@ const LOGIN_ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
 const MAX_LOGIN_ATTEMPTS = 8;
 const MIN_UPLOAD_PASSWORD_LENGTH = 12;
 const MIN_AUTH_SECRET_LENGTH = 32;
+const MAX_DELETE_BODY_BYTES = 1024 * 1024;
+const MAX_DELETE_IMAGE_IDS = 5000;
+const R2_DELETE_BATCH_SIZE = 1000;
 const SESSION_COOKIE = "neuro_gallery_session";
 const SESSION_TTL_SECONDS = 60 * 60 * 12;
 const ALLOWED_TYPES = new Set<string>(ACCEPTED_IMAGE_TYPES);
@@ -48,6 +51,9 @@ type MultipartStartPayload = {
 type MultipartCompletePayload = {
   parts?: unknown;
   uploadId?: unknown;
+};
+type DeleteImagesPayload = {
+  ids?: unknown;
 };
 type MultipartUploadState = {
   contentType: string;
@@ -148,6 +154,16 @@ export default {
           }
 
           return handleUpload(request, env);
+        }
+
+        if (request.method === "DELETE") {
+          const guard = await mutationGuard(request, env);
+
+          if (guard) {
+            return guard;
+          }
+
+          return handleBulkDelete(request, env);
         }
       }
 
@@ -496,6 +512,62 @@ async function handleDelete(id: string, env: Env): Promise<Response> {
 
   await env.IMAGES.delete(toStorageKey(id));
   return json({ ok: true });
+}
+
+async function handleBulkDelete(request: Request, env: Env): Promise<Response> {
+  if (requestBodyTooLarge(request, MAX_DELETE_BODY_BYTES)) {
+    return json({ error: "Delete request is too large." }, 413);
+  }
+
+  const payload = (await request.json().catch(() => null)) as DeleteImagesPayload | null;
+  const parsed = parseDeleteImageIds(payload);
+
+  if ("error" in parsed) {
+    return json({ error: parsed.error }, 400);
+  }
+
+  await deleteImageIds(parsed.ids, env);
+  return json({ ok: true, deleted: parsed.ids, count: parsed.ids.length });
+}
+
+async function deleteImageIds(ids: string[], env: Env): Promise<void> {
+  const keyBatches: string[][] = [];
+
+  for (let index = 0; index < ids.length; index += R2_DELETE_BATCH_SIZE) {
+    keyBatches.push(ids.slice(index, index + R2_DELETE_BATCH_SIZE).map((id) => toStorageKey(id)));
+  }
+
+  await Promise.all(keyBatches.map((keys) => env.IMAGES.delete(keys)));
+}
+
+function parseDeleteImageIds(payload: DeleteImagesPayload | null): { ids: string[] } | { error: string } {
+  if (!payload || !Array.isArray(payload.ids)) {
+    return { error: "Provide image ids to delete." };
+  }
+
+  if (payload.ids.length > MAX_DELETE_IMAGE_IDS) {
+    return { error: `Delete at most ${MAX_DELETE_IMAGE_IDS} images at a time.` };
+  }
+
+  const ids: string[] = [];
+  const seen = new Set<string>();
+
+  for (const id of payload.ids) {
+    if (typeof id !== "string" || !isValidImageId(id)) {
+      return { error: "Delete request contains an invalid image id." };
+    }
+
+    if (!seen.has(id)) {
+      ids.push(id);
+      seen.add(id);
+    }
+  }
+
+  if (ids.length === 0) {
+    return { error: "Select at least one image to delete." };
+  }
+
+  return { ids };
 }
 
 async function handleRandom(request: Request, env: Env): Promise<Response> {

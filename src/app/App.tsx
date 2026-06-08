@@ -14,7 +14,7 @@ import {
   Trash2,
   UploadCloud,
 } from "lucide-react";
-import { deleteImage, fetchAuthSession, fetchImages, fetchRandomImage, login, logout, uploadImages } from "./api";
+import { deleteImage, deleteImages, fetchAuthSession, fetchImages, fetchRandomImage, login, logout, uploadImages } from "./api";
 import type { GalleryImage } from "./types";
 import { ACCEPTED_IMAGE_TYPES } from "../uploadLimits";
 
@@ -170,16 +170,10 @@ export function App() {
 
     setStatus("deleting");
     setError("");
+    setMessage(`Deleting ${idsToDelete.length} selected image${idsToDelete.length === 1 ? "" : "s"}...`);
 
     try {
-      const results = await Promise.allSettled(
-        idsToDelete.map(async (id) => {
-          await deleteImage(id);
-          return id;
-        }),
-      );
-      const deletedIds = results.flatMap((result) => (result.status === "fulfilled" ? [result.value] : []));
-      const failedCount = results.length - deletedIds.length;
+      const deletedIds = await deleteImages(idsToDelete);
       const deletedIdSet = new Set(deletedIds);
 
       if (deletedIds.length) {
@@ -190,12 +184,7 @@ export function App() {
         setRandomImage((current) => (current && deletedIdSet.has(current.id) ? nextImages[0] ?? null : current));
       }
 
-      if (failedCount) {
-        setError(`${failedCount} selected image${failedCount === 1 ? "" : "s"} could not be deleted.`);
-        setMessage(`${deletedIds.length} deleted, ${failedCount} failed.`);
-      } else {
-        setMessage(`${deletedIds.length} selected image${deletedIds.length === 1 ? "" : "s"} removed from the random pool.`);
-      }
+      setMessage(`${deletedIds.length} selected image${deletedIds.length === 1 ? "" : "s"} removed from the random pool.`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Delete failed.");
     } finally {
