@@ -16,12 +16,17 @@ import {
 } from "lucide-react";
 import { deleteImage, fetchAuthSession, fetchImages, fetchRandomImage, login, logout, uploadImages } from "./api";
 import type { GalleryImage } from "./types";
+import {
+  ACCEPTED_IMAGE_TYPES,
+  MAX_UPLOAD_BYTES,
+  MAX_UPLOAD_FILES,
+  MAX_UPLOAD_SIZE_LABEL,
+  MAX_UPLOAD_TOTAL_BYTES,
+  MAX_UPLOAD_TOTAL_SIZE_LABEL,
+} from "../uploadLimits";
 
 type Status = "idle" | "loading" | "uploading" | "randomizing" | "deleting";
 type AuthStatus = "checking" | "idle" | "signing-in" | "signing-out";
-
-const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
-const ACCEPTED_TYPES = ["image/avif", "image/gif", "image/jpeg", "image/png", "image/webp"];
 
 export function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -190,21 +195,31 @@ export function App() {
   }
 
   function validateFiles(files: File[]) {
-    const valid = files.filter((file) => {
-      if (!ACCEPTED_TYPES.includes(file.type)) {
+    if (files.length > MAX_UPLOAD_FILES) {
+      setError(`Upload at most ${MAX_UPLOAD_FILES} images at once.`);
+      return [];
+    }
+
+    const totalBytes = files.reduce((total, file) => total + file.size, 0);
+
+    if (totalBytes > MAX_UPLOAD_TOTAL_BYTES) {
+      setError(`Combined upload size is too large. Keep each batch under ${MAX_UPLOAD_TOTAL_SIZE_LABEL}.`);
+      return [];
+    }
+
+    for (const file of files) {
+      if (!isAcceptedImageType(file.type)) {
         setError(`${file.name} is not a supported image type.`);
-        return false;
+        return [];
       }
 
       if (file.size > MAX_UPLOAD_BYTES) {
-        setError(`${file.name} is larger than 10 MB.`);
-        return false;
+        setError(`${file.name} is larger than ${MAX_UPLOAD_SIZE_LABEL}.`);
+        return [];
       }
+    }
 
-      return true;
-    });
-
-    return valid;
+    return files;
   }
 
   function onInputChange(event: ChangeEvent<HTMLInputElement>) {
@@ -394,7 +409,7 @@ export function App() {
               ref={fileInputRef}
               className="file-input"
               type="file"
-              accept={ACCEPTED_TYPES.join(",")}
+              accept={ACCEPTED_IMAGE_TYPES.join(",")}
               multiple
               disabled={!authenticated || busy}
               onChange={onInputChange}
@@ -402,7 +417,7 @@ export function App() {
             <UploadCloud size={24} />
             <div>
               <strong>{authenticated ? (status === "uploading" ? "Uploading..." : "Drop images") : "Upload locked"}</strong>
-              <span>{authenticated ? "PNG, JPEG, WebP, AVIF, GIF up to 10 MB" : "Sign in first"}</span>
+              <span>{authenticated ? `PNG, JPEG, WebP, AVIF, GIF. ${MAX_UPLOAD_FILES} files, ${MAX_UPLOAD_SIZE_LABEL} each.` : "Sign in first"}</span>
             </div>
           </div>
 
@@ -451,6 +466,10 @@ export function App() {
       </section>
     </main>
   );
+}
+
+function isAcceptedImageType(type: string) {
+  return ACCEPTED_IMAGE_TYPES.includes(type as (typeof ACCEPTED_IMAGE_TYPES)[number]);
 }
 
 function formatBytes(bytes: number) {

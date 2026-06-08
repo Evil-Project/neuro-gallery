@@ -1,7 +1,13 @@
+import {
+  ACCEPTED_IMAGE_TYPES,
+  MAX_UPLOAD_BODY_BYTES,
+  MAX_UPLOAD_BYTES,
+  MAX_UPLOAD_FILES,
+  MAX_UPLOAD_SIZE_LABEL,
+  MAX_UPLOAD_TOTAL_BYTES,
+} from "./uploadLimits";
+
 const IMAGE_PREFIX = "images/";
-const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
-const MAX_UPLOAD_FILES = 8;
-const MAX_UPLOAD_BODY_BYTES = MAX_UPLOAD_BYTES * MAX_UPLOAD_FILES;
 const MAX_LOGIN_BODY_BYTES = 2048;
 const LOGIN_ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
 const MAX_LOGIN_ATTEMPTS = 8;
@@ -9,13 +15,7 @@ const MIN_UPLOAD_PASSWORD_LENGTH = 12;
 const MIN_AUTH_SECRET_LENGTH = 32;
 const SESSION_COOKIE = "neuro_gallery_session";
 const SESSION_TTL_SECONDS = 60 * 60 * 12;
-const ALLOWED_TYPES = new Set([
-  "image/avif",
-  "image/gif",
-  "image/jpeg",
-  "image/png",
-  "image/webp",
-]);
+const ALLOWED_TYPES = new Set<string>(ACCEPTED_IMAGE_TYPES);
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 const EXTENSIONS_BY_TYPE = new Map([
   ["image/avif", ".avif"],
@@ -207,7 +207,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
 
   const totalUploadBytes = files.reduce((total, file) => total + file.size, 0);
 
-  if (totalUploadBytes > MAX_UPLOAD_BODY_BYTES) {
+  if (totalUploadBytes > MAX_UPLOAD_TOTAL_BYTES) {
     return json({ error: "Combined upload size is too large." }, 413);
   }
 
@@ -215,7 +215,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
 
   for (const file of files) {
     if (file.size > MAX_UPLOAD_BYTES) {
-      return json({ error: `${file.name} is larger than 10 MB.` }, 413);
+      return json({ error: `${file.name} is larger than ${MAX_UPLOAD_SIZE_LABEL}.` }, 413);
     }
 
     const bytes = new Uint8Array(await file.arrayBuffer());
