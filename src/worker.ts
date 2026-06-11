@@ -12,6 +12,7 @@ const MAX_DELETE_IMAGE_IDS = 5000;
 const R2_DELETE_BATCH_SIZE = 1000;
 const SESSION_COOKIE = "neuro_gallery_session";
 const SESSION_TTL_SECONDS = 60 * 60 * 12;
+const PUBLIC_IMAGE_BASE_URL = "https://images.evilneur.org/";
 const ALLOWED_TYPES = new Set<string>(ACCEPTED_IMAGE_TYPES);
 const ILLEGAL_FILENAME_CHARACTERS = /[\x00-\x1f\x7f<>:"/\\|?*]+/g;
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
@@ -290,7 +291,7 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
       size: file.size,
       uploadedAt,
       contentType,
-      url: `/api/images/${encodeURIComponent(id)}`,
+      url: toPublicImageUrl(id),
     });
   }
 
@@ -356,7 +357,7 @@ async function handleMultipartStart(request: Request, env: Env): Promise<Respons
     size: payload.size,
     uploadedAt,
     contentType: payload.contentType,
-    url: `/api/images/${encodeURIComponent(id)}`,
+    url: toPublicImageUrl(id),
   });
 }
 
@@ -451,7 +452,7 @@ async function handleMultipartComplete(request: Request, env: Env, id: string): 
       size: object.size || state.size,
       uploadedAt: state.uploadedAt,
       contentType: state.contentType,
-      url: `/api/images/${encodeURIComponent(state.id)}`,
+      url: toPublicImageUrl(state.id),
     },
   });
 }
@@ -625,8 +626,12 @@ function toImageRecord(object: R2Object): ImageRecord {
     size: object.size,
     uploadedAt: metadata.uploadedAt || object.uploaded.toISOString(),
     contentType: object.httpMetadata?.contentType || "image/*",
-    url: `/api/images/${encodeURIComponent(id)}`,
+    url: toPublicImageUrl(id),
   };
+}
+
+function toPublicImageUrl(id: string): string {
+  return new URL(`${IMAGE_PREFIX}${encodeURIComponent(id)}`, PUBLIC_IMAGE_BASE_URL).toString();
 }
 
 function createImageId(fileName: string, contentType: string): string {

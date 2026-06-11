@@ -7,6 +7,7 @@ A Cloudflare Worker image API with a React frontend. Users upload their own imag
 - React + Vite frontend for image upload, preview, gallery management, and random selection.
 - Cloudflare Worker API for uploads, listing, deletion, object serving, and random redirects.
 - R2-backed storage so uploaded images persist across Worker instances.
+- Public image URLs use the R2 custom domain `https://images.evilneur.org/`.
 - Signed upload sessions so only authenticated users can upload or delete images.
 - `/api/random?format=json` returns metadata; `/random` redirects directly to the selected image.
 
@@ -66,11 +67,10 @@ npm run dev:worker
 
 ## Manual Deploy
 
-For local or manual deploys, create the R2 buckets named in `wrangler.toml`:
+For local or manual deploys, create the R2 bucket named in `wrangler.toml`:
 
 ```sh
 npx wrangler r2 bucket create neuro-gallery-images
-npx wrangler r2 bucket create neuro-gallery-images-dev
 ```
 
 Create the production secrets:
@@ -104,4 +104,4 @@ npx wrangler secret put UPLOAD_PASSWORD
 npx wrangler secret put AUTH_SECRET
 ```
 
-To use different bucket names, update `bucket_name` and `preview_bucket_name` in `wrangler.toml`.
+To use a different bucket name, update `bucket_name` in `wrangler.toml`.

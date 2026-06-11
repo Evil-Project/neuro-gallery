@@ -11,4 +11,3 @@ run_worker_first = ["/api/*", "/random"]
 [[r2_buckets]]
 binding = "IMAGES"
 bucket_name = "neuro-gallery-images"
-preview_bucket_name = "neuro-gallery-images-dev"
