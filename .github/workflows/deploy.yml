@@ -86,7 +86,24 @@ jobs:
           AUTH_SECRET: ${{ secrets.AUTH_SECRET }}
 
       - name: Deploy
-        run: npx wrangler deploy --secrets-file "$WORKER_SECRETS_FILE"
+        run: |
+          max_attempts=3
+          delay_seconds=20
+
+          for attempt in $(seq 1 "$max_attempts"); do
+            if npx wrangler deploy --secrets-file "$WORKER_SECRETS_FILE"; then
+              exit 0
+            fi
+
+            if [ "$attempt" -eq "$max_attempts" ]; then
+              echo "Wrangler deploy failed after $max_attempts attempts."
+              exit 1
+            fi
+
+            echo "Wrangler deploy failed on attempt $attempt. Retrying in ${delay_seconds}s..."
+            sleep "$delay_seconds"
+            delay_seconds=$((delay_seconds * 2))
+          done
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
