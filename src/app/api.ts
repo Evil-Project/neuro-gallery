@@ -4,6 +4,7 @@ import type {
   DeleteImagesResponse,
   GalleryImage,
   ImagesResponse,
+  MultipartUploadCleanupResponse,
   MultipartUploadCompleteResponse,
   MultipartUploadPartResponse,
   MultipartUploadStartResponse,
@@ -121,6 +122,13 @@ function delay(milliseconds: number) {
 export async function fetchImages(): Promise<GalleryImage[]> {
   const payload = await requestJson<ImagesResponse>("/api/images");
   return payload.images;
+}
+
+export async function cleanupBrokenUploads(): Promise<MultipartUploadCleanupResponse> {
+  return requestJson<MultipartUploadCleanupResponse>("/api/uploads/multipart/cleanup", {
+    method: "POST",
+    credentials: "same-origin",
+  });
 }
 
 export async function uploadImages(files: File[], onProgress?: (progress: UploadProgress) => void): Promise<GalleryImage[]> {

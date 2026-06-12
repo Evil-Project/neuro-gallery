@@ -44,6 +44,16 @@ export interface MultipartUploadCompleteResponse {
   image: GalleryImage;
 }
 
+export interface MultipartUploadCleanupResponse {
+  aborted: number;
+  errors: number;
+  inspected: number;
+  removed: number;
+  skipped: number;
+  staleAfterMs: number;
+  staleBefore: string;
+}
+
 export interface RandomResponse {
   image: GalleryImage;
 }

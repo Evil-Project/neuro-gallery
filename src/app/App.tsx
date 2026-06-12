@@ -14,7 +14,7 @@ import {
   Trash2,
   UploadCloud,
 } from "lucide-react";
-import { deleteImage, deleteImages, fetchAuthSession, fetchImages, fetchRandomImage, login, logout, uploadImages } from "./api";
+import { cleanupBrokenUploads, deleteImage, deleteImages, fetchAuthSession, fetchImages, fetchRandomImage, login, logout, uploadImages } from "./api";
 import type { GalleryImage } from "./types";
 import { ACCEPTED_IMAGE_TYPES } from "../uploadLimits";
 
@@ -73,6 +73,20 @@ export function App() {
       mounted = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!authenticated) {
+      return;
+    }
+
+    cleanupBrokenUploads()
+      .then((cleanup) => {
+        if (cleanup.removed > 0) {
+          setMessage(`${cleanup.removed} broken upload${cleanup.removed === 1 ? "" : "s"} canceled.`);
+        }
+      })
+      .catch(() => undefined);
+  }, [authenticated]);
 
   useEffect(() => {
     const imageIds = new Set(images.map((image) => image.id));

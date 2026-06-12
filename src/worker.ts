@@ -10,6 +10,7 @@ const MIN_AUTH_SECRET_LENGTH = 32;
 const MAX_DELETE_BODY_BYTES = 1024 * 1024;
 const MAX_DELETE_IMAGE_IDS = 5000;
 const R2_DELETE_BATCH_SIZE = 1000;
+const STALE_MULTIPART_UPLOAD_MS = 12 * 60 * 60 * 1000;
 const SESSION_COOKIE = "neuro_gallery_session";
 const SESSION_TTL_SECONDS = 60 * 60 * 12;
 const PUBLIC_IMAGE_BASE_URL = "https://images.evilneur.org/";
@@ -56,6 +57,15 @@ type MultipartCompletePayload = {
 type DeleteImagesPayload = {
   ids?: unknown;
 };
+type MultipartCleanupResult = {
+  aborted: number;
+  errors: number;
+  inspected: number;
+  removed: number;
+  skipped: number;
+  staleAfterMs: number;
+  staleBefore: string;
+};
 type MultipartUploadState = {
   contentType: string;
   id: string;
@@ -78,6 +88,10 @@ type UploadFile = File & {
 };
 
 export default {
+  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    await cleanupStaleMultipartUploads(env);
+  },
+
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
@@ -114,6 +128,16 @@ export default {
         }
 
         return handleMultipartStart(request, env);
+      }
+
+      if (url.pathname === "/api/uploads/multipart/cleanup" && request.method === "POST") {
+        const guard = await mutationGuard(request, env);
+
+        if (guard) {
+          return guard;
+        }
+
+        return handleMultipartCleanup(env);
       }
 
       const multipartRoute = parseMultipartRoute(url.pathname);
@@ -299,6 +323,8 @@ async function handleUpload(request: Request, env: Env): Promise<Response> {
 }
 
 async function handleMultipartStart(request: Request, env: Env): Promise<Response> {
+  await cleanupStaleMultipartUploads(env);
+
   const payload = (await request.json().catch(() => ({}))) as MultipartStartPayload;
 
   if (typeof payload.name !== "string" || !payload.name.trim()) {
@@ -477,6 +503,66 @@ async function handleMultipartAbort(request: Request, env: Env, id: string): Pro
   await env.IMAGES.delete(toMultipartStateKey(id));
 
   return json({ ok: true });
+}
+
+async function handleMultipartCleanup(env: Env): Promise<Response> {
+  return json(await cleanupStaleMultipartUploads(env));
+}
+
+async function cleanupStaleMultipartUploads(env: Env): Promise<MultipartCleanupResult> {
+  const now = Date.now();
+  const staleBeforeMs = now - STALE_MULTIPART_UPLOAD_MS;
+  const result: MultipartCleanupResult = {
+    aborted: 0,
+    errors: 0,
+    inspected: 0,
+    removed: 0,
+    skipped: 0,
+    staleAfterMs: STALE_MULTIPART_UPLOAD_MS,
+    staleBefore: new Date(staleBeforeMs).toISOString(),
+  };
+  let cursor: string | undefined;
+
+  do {
+    const listed = await env.IMAGES.list({
+      prefix: MULTIPART_UPLOAD_PREFIX,
+      cursor,
+      limit: 1000,
+    });
+
+    for (const object of listed.objects) {
+      result.inspected += 1;
+
+      const state = await getMultipartStateFromKey(env, object.key);
+
+      if (!state) {
+        await env.IMAGES.delete(object.key);
+        result.removed += 1;
+        continue;
+      }
+
+      const uploadedAt = Date.parse(state.uploadedAt);
+
+      if (Number.isFinite(uploadedAt) && uploadedAt > staleBeforeMs) {
+        result.skipped += 1;
+        continue;
+      }
+
+      try {
+        await env.IMAGES.resumeMultipartUpload(state.key, state.uploadId).abort();
+        result.aborted += 1;
+      } catch {
+        result.errors += 1;
+      }
+
+      await env.IMAGES.delete(object.key);
+      result.removed += 1;
+    }
+
+    cursor = listed.truncated ? listed.cursor : undefined;
+  } while (cursor);
+
+  return result;
 }
 
 async function removeMultipartState(env: Env, state: MultipartUploadState): Promise<void> {
@@ -881,17 +967,46 @@ function clearLoginAttempts(key: string): void {
 }
 
 async function getMultipartState(env: Env, id: string): Promise<MultipartUploadState | null> {
-  const object = await env.IMAGES.get(toMultipartStateKey(id));
+  return getMultipartStateFromKey(env, toMultipartStateKey(id));
+}
+
+async function getMultipartStateFromKey(env: Env, key: string): Promise<MultipartUploadState | null> {
+  const object = await env.IMAGES.get(key);
 
   if (!object) {
     return null;
   }
 
   try {
-    return (await object.json()) as MultipartUploadState;
+    const value = await object.json();
+    return isMultipartUploadState(value) ? value : null;
   } catch {
     return null;
   }
+}
+
+function isMultipartUploadState(value: unknown): value is MultipartUploadState {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const state = value as Record<string, unknown>;
+
+  return (
+    typeof state.contentType === "string" &&
+    typeof state.id === "string" &&
+    typeof state.key === "string" &&
+    typeof state.name === "string" &&
+    typeof state.partSize === "number" &&
+    typeof state.size === "number" &&
+    typeof state.uploadedAt === "string" &&
+    typeof state.uploadId === "string" &&
+    isValidImageId(state.id) &&
+    state.key === toStorageKey(state.id) &&
+    state.partSize > 0 &&
+    state.size > 0 &&
+    state.uploadId.length > 0
+  );
 }
 
 function parseUploadedParts(value: unknown): R2UploadedPart[] {
