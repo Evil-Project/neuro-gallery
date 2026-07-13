@@ -30,6 +30,10 @@
   --soft-line: rgba(93, 122, 138, 0.16);
   --paper-shadow: 0 14px 36px rgba(93, 122, 138, 0.09);
   --pearl-shadow: inset 0 2px 3px rgba(255, 255, 255, 0.92), 0 6px 12px rgba(93, 122, 138, 0.12);
+  --masthead-height: 76px;
+  --safe-inline-start: max(18px, env(safe-area-inset-left, 0px));
+  --safe-inline-end: max(18px, env(safe-area-inset-right, 0px));
+  --safe-block-end: max(24px, env(safe-area-inset-bottom, 0px));
 }
 
 * {
@@ -215,13 +219,18 @@ input:focus-visible,
 }
 
 .workspace {
+  --workspace-top-space: 34px;
+  --workspace-bottom-space: 56px;
+  --workspace-safe-height: calc(100svh - var(--masthead-height) - var(--workspace-top-space) - var(--safe-block-end));
   display: grid;
   grid-template-columns: minmax(0, 1.62fr) minmax(350px, 0.88fr);
+  grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
   gap: 28px;
-  width: min(100%, 1228px);
+  width: min(calc(100vw - var(--safe-inline-start) - var(--safe-inline-end)), 1228px);
+  min-height: calc(100svh - var(--masthead-height));
   margin: 0 auto;
-  padding: 34px 24px 56px;
+  padding: var(--workspace-top-space) 0 var(--workspace-bottom-space);
 }
 
 .notebook-sheet {
@@ -288,7 +297,11 @@ input:focus-visible,
 }
 
 .random-sheet {
-  height: 100%;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  height: var(--workspace-safe-height);
+  min-height: 0;
+  max-height: var(--workspace-safe-height);
   padding: 36px 36px 32px 58px;
 }
 
@@ -394,7 +407,8 @@ h2 {
 .preview-frame img {
   width: 100%;
   height: 100%;
-  object-fit: contain;
+  object-fit: cover;
+  object-position: center center;
   background: #fff;
 }
 
@@ -567,11 +581,11 @@ h2 {
 
 .gallery-panel {
   position: sticky;
-  top: 116px;
+  top: calc(var(--masthead-height) + var(--workspace-top-space));
   display: flex;
   flex-direction: column;
   gap: 16px;
-  height: 100%;
+  height: var(--workspace-safe-height);
   min-height: 0;
   padding: 32px 24px 24px 50px;
   overflow: hidden;
@@ -1016,13 +1030,23 @@ h2 {
 
 @media (max-width: 960px) {
   .workspace {
+    --workspace-safe-height: auto;
     grid-template-columns: minmax(0, 1fr);
     width: min(100%, 820px);
+    min-height: 0;
+    padding-right: 24px;
+    padding-left: 24px;
   }
 
   .gallery-panel {
     position: relative;
     top: auto;
+    height: auto;
+    max-height: none;
+  }
+
+  .random-sheet {
+    height: auto;
     max-height: none;
   }
 
