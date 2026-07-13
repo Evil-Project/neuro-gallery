@@ -1,2 +1,2 @@
-UPLOAD_PASSWORD=change-this-upload-password
-AUTH_SECRET=change-this-long-random-session-secret
+UPLOAD_PASSWORD=replace-me
+AUTH_SECRET=replace-me

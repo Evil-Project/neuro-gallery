@@ -1,20 +1,34 @@
 import { ChangeEvent, DragEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Aperture,
   ArrowUpRight,
   Copy,
   Dices,
   ImagePlus,
+  Images,
   KeyRound,
   Loader2,
   LogIn,
   LogOut,
   RefreshCw,
   ShieldCheck,
+  Sparkles,
   Trash2,
   UploadCloud,
 } from "lucide-react";
-import { cleanupBrokenUploads, deleteImage, deleteImages, fetchAuthSession, fetchImages, fetchRandomImage, login, logout, uploadImages } from "./api";
+import { API_ROUTES, PUBLIC_RANDOM_PATH } from "../apiContract";
+import {
+  DeleteBatchError,
+  UploadBatchError,
+  deleteImage,
+  deleteImages,
+  fetchAuthSession,
+  fetchImages,
+  fetchRandomImage,
+  isAuthenticationError,
+  login,
+  logout,
+  uploadImages,
+} from "./api";
 import type { GalleryImage } from "./types";
 import { ACCEPTED_IMAGE_TYPES } from "../uploadLimits";
 
@@ -24,6 +38,7 @@ type AuthStatus = "checking" | "idle" | "signing-in" | "signing-out";
 export function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const selectAllRef = useRef<HTMLInputElement>(null);
+  const mutationLockRef = useRef(false);
   const [images, setImages] = useState<GalleryImage[]>([]);
   const [randomImage, setRandomImage] = useState<GalleryImage | null>(null);
   const [status, setStatus] = useState<Status>("loading");
@@ -40,19 +55,18 @@ export function App() {
   const selectedCount = selectedImageIds.length;
   const allImagesSelected = images.length > 0 && selectedCount === images.length;
   const randomUrl = randomImage ? new URL(randomImage.url, window.location.origin).toString() : "";
-  const redirectUrl = new URL("/random", window.location.origin).toString();
+  const redirectUrl = new URL(PUBLIC_RANDOM_PATH, window.location.origin).toString();
 
   useEffect(() => {
     let mounted = true;
 
-    Promise.all([fetchImages(), fetchAuthSession()])
-      .then(([items, sessionAuthenticated]) => {
+    fetchImages()
+      .then((items) => {
         if (!mounted) {
           return;
         }
 
         setImages(items);
-        setAuthenticated(sessionAuthenticated);
         setRandomImage(items[0] ?? null);
         setMessage(items.length ? `${items.length} image${items.length === 1 ? "" : "s"} ready.` : "Upload images to seed the random API.");
       })
@@ -65,6 +79,22 @@ export function App() {
       .finally(() => {
         if (mounted) {
           setStatus("idle");
+        }
+      });
+
+    fetchAuthSession()
+      .then((sessionAuthenticated) => {
+        if (mounted) {
+          setAuthenticated(sessionAuthenticated);
+        }
+      })
+      .catch((err: Error) => {
+        if (mounted) {
+          setError(err.message);
+        }
+      })
+      .finally(() => {
+        if (mounted) {
           setAuthStatus("idle");
         }
       });
@@ -73,20 +103,6 @@ export function App() {
       mounted = false;
     };
   }, []);
-
-  useEffect(() => {
-    if (!authenticated) {
-      return;
-    }
-
-    cleanupBrokenUploads()
-      .then((cleanup) => {
-        if (cleanup.removed > 0) {
-          setMessage(`${cleanup.removed} broken upload${cleanup.removed === 1 ? "" : "s"} canceled.`);
-        }
-      })
-      .catch(() => undefined);
-  }, [authenticated]);
 
   useEffect(() => {
     const imageIds = new Set(images.map((image) => image.id));
@@ -104,6 +120,11 @@ export function App() {
   }, [allImagesSelected, selectedCount]);
 
   async function handleUpload(files: File[]) {
+    if (busy || mutationLockRef.current) {
+      setError("Wait for the current operation to finish.");
+      return;
+    }
+
     if (!authenticated) {
       setError("Sign in to upload images.");
       return;
@@ -114,6 +135,8 @@ export function App() {
     if (!imageFiles.length) {
       return;
     }
+
+    mutationLockRef.current = true;
 
     setError("");
     setCopied(false);
@@ -126,15 +149,24 @@ export function App() {
           `Uploading ${progress.fileName} (${progress.fileIndex + 1}/${progress.fileCount}): ${formatBytes(progress.uploadedBytes)} of ${formatBytes(progress.totalBytes)}...`,
         );
       });
-      const nextImages = await fetchImages();
 
-      setImages(nextImages);
-      setRandomImage(uploaded[0] ?? nextImages[0] ?? null);
+      setImages((current) => mergeImagesByNewest(current, uploaded));
+      setRandomImage(uploaded[0] ?? null);
       setMessage(`${uploaded.length} upload${uploaded.length === 1 ? "" : "s"} added to the random pool.`);
     } catch (err) {
+      if (isAuthenticationError(err)) {
+        setAuthenticated(false);
+      }
+
+      if (err instanceof UploadBatchError) {
+        setImages((current) => mergeImagesByNewest(current, err.uploaded));
+        setRandomImage(err.uploaded[0] ?? null);
+      }
+
       setError(err instanceof Error ? err.message : "Upload failed.");
-      setMessage("Upload failed.");
+      setMessage(err instanceof UploadBatchError ? "Upload stopped after a partial success." : "Upload failed.");
     } finally {
+      mutationLockRef.current = false;
       setStatus("idle");
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
@@ -160,6 +192,37 @@ export function App() {
     }
   }
 
+  async function refreshImages() {
+    if (busy || mutationLockRef.current) {
+      return;
+    }
+
+    mutationLockRef.current = true;
+    setError("");
+    setStatus("loading");
+    setMessage("Refreshing gallery...");
+
+    try {
+      const nextImages = await fetchImages("no-cache");
+
+      setImages(nextImages);
+      setRandomImage((current) => {
+        if (!current) {
+          return nextImages[0] ?? null;
+        }
+
+        return nextImages.find((image) => image.id === current.id) ?? nextImages[0] ?? null;
+      });
+      setMessage(nextImages.length ? `${nextImages.length} image${nextImages.length === 1 ? "" : "s"} ready.` : "Upload images to seed the random API.");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "The gallery could not be refreshed.");
+      setMessage("The gallery could not be refreshed.");
+    } finally {
+      mutationLockRef.current = false;
+      setStatus("idle");
+    }
+  }
+
   function toggleImageSelection(id: string) {
     setSelectedImageIds((current) => (current.includes(id) ? current.filter((selectedId) => selectedId !== id) : [...current, id]));
   }
@@ -169,6 +232,11 @@ export function App() {
   }
 
   async function removeSelectedImages() {
+    if (busy || mutationLockRef.current) {
+      setError("Wait for the current operation to finish.");
+      return;
+    }
+
     if (!authenticated) {
       setError("Sign in to remove images.");
       return;
@@ -182,35 +250,74 @@ export function App() {
       return;
     }
 
+    mutationLockRef.current = true;
+
     setStatus("deleting");
     setError("");
     setMessage(`Deleting ${idsToDelete.length} selected image${idsToDelete.length === 1 ? "" : "s"}...`);
 
     try {
       const deletedIds = await deleteImages(idsToDelete);
-      const deletedIdSet = new Set(deletedIds);
-
-      if (deletedIds.length) {
-        const nextImages = images.filter((image) => !deletedIdSet.has(image.id));
-
-        setImages(nextImages);
-        setSelectedImageIds((current) => current.filter((id) => !deletedIdSet.has(id)));
-        setRandomImage((current) => (current && deletedIdSet.has(current.id) ? nextImages[0] ?? null : current));
-      }
+      applyDeletedImages(deletedIds);
 
       setMessage(`${deletedIds.length} selected image${deletedIds.length === 1 ? "" : "s"} removed from the random pool.`);
     } catch (err) {
+      if (isAuthenticationError(err)) {
+        setAuthenticated(false);
+      }
+
+      if (err instanceof DeleteBatchError) {
+        applyDeletedImages(err.deleted);
+        setMessage("Delete stopped after a partial success.");
+      }
+
+      await reconcileGalleryAfterFailure();
+
       setError(err instanceof Error ? err.message : "Delete failed.");
     } finally {
+      mutationLockRef.current = false;
       setStatus("idle");
     }
   }
 
+  function applyDeletedImages(deletedIds: string[]) {
+    if (deletedIds.length === 0) {
+      return;
+    }
+
+    const deletedIdSet = new Set(deletedIds);
+    const nextImages = images.filter((image) => !deletedIdSet.has(image.id));
+
+    setImages(nextImages);
+    setSelectedImageIds((current) => current.filter((id) => !deletedIdSet.has(id)));
+    setRandomImage((current) => (current && deletedIdSet.has(current.id) ? nextImages[0] ?? null : current));
+  }
+
+  async function reconcileGalleryAfterFailure() {
+    try {
+      const nextImages = await fetchImages("no-cache");
+
+      setImages(nextImages);
+      setRandomImage((current) =>
+        current ? nextImages.find((image) => image.id === current.id) ?? nextImages[0] ?? null : nextImages[0] ?? null,
+      );
+    } catch {
+      // Keep the original mutation error; the user can retry the explicit refresh later.
+    }
+  }
+
   async function removeImage(id: string) {
+    if (busy || mutationLockRef.current) {
+      setError("Wait for the current operation to finish.");
+      return;
+    }
+
     if (!authenticated) {
       setError("Sign in to remove images.");
       return;
     }
+
+    mutationLockRef.current = true;
 
     setStatus("deleting");
     setError("");
@@ -223,8 +330,14 @@ export function App() {
       setRandomImage((current) => (current?.id === id ? nextImages[0] ?? null : current));
       setMessage("Image removed from the random pool.");
     } catch (err) {
+      if (isAuthenticationError(err)) {
+        setAuthenticated(false);
+      }
+
+      await reconcileGalleryAfterFailure();
       setError(err instanceof Error ? err.message : "Delete failed.");
     } finally {
+      mutationLockRef.current = false;
       setStatus("idle");
     }
   }
@@ -236,10 +349,16 @@ export function App() {
   }
 
   async function signIn() {
+    if (busy || mutationLockRef.current) {
+      return;
+    }
+
     if (!password) {
       setError("Enter the upload password.");
       return;
     }
+
+    mutationLockRef.current = true;
 
     setError("");
     setAuthStatus("signing-in");
@@ -252,11 +371,18 @@ export function App() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Sign in failed.");
     } finally {
+      mutationLockRef.current = false;
       setAuthStatus("idle");
     }
   }
 
   async function signOut() {
+    if (busy || mutationLockRef.current) {
+      return;
+    }
+
+    mutationLockRef.current = true;
+
     setError("");
     setAuthStatus("signing-out");
 
@@ -267,6 +393,7 @@ export function App() {
     } catch (err) {
       setError(err instanceof Error ? err.message : "Sign out failed.");
     } finally {
+      mutationLockRef.current = false;
       setAuthStatus("idle");
     }
   }
@@ -289,87 +416,111 @@ export function App() {
   function onDrop(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
     setDragging(false);
-    handleUpload(Array.from(event.dataTransfer.files));
+
+    if (!busy) {
+      handleUpload(Array.from(event.dataTransfer.files));
+    }
   }
 
-  const busy = status !== "idle" || authStatus === "checking";
-  const authBusy = authStatus === "signing-in" || authStatus === "signing-out";
+  const busy = status !== "idle" || authStatus !== "idle";
+  const authBusy = busy;
 
   return (
     <main className="shell">
-      <section className="workspace" aria-label="Neuro Gallery image API">
-        <aside className="control-rail">
-          <div className="brand-mark" aria-label="Neuro Gallery">
-            <Aperture size={24} strokeWidth={1.8} />
+      <header className="site-masthead">
+        <div className="masthead-inner">
+          <div className="brand-lockup" aria-label="Neuro Gallery">
+            <span className="brand-emblem" aria-hidden="true">
+              <Images size={25} strokeWidth={1.8} />
+            </span>
+            <span className="brand-name" aria-hidden="true">
+              <span>Neuro</span>
+              <span>Gallery</span>
+            </span>
           </div>
 
-          <button
-            className="icon-button"
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={busy || !authenticated}
-            title="Upload images"
-            aria-label="Upload images"
-          >
-            <ImagePlus size={22} />
-          </button>
+          <nav className="masthead-tools" aria-label="Gallery tools">
+            <button
+              className="tool-button"
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={busy || !authenticated}
+              title="Upload images"
+              aria-label="Upload images"
+              data-tooltip="Upload images"
+            >
+              <ImagePlus size={19} />
+            </button>
+            <button
+              className="tool-button"
+              type="button"
+              onClick={pickRandom}
+              disabled={busy || images.length === 0}
+              title="Pick random image"
+              aria-label="Pick random image"
+              data-tooltip="Pick random"
+            >
+              <Dices size={19} />
+            </button>
+            <button
+              className="tool-button"
+              type="button"
+              onClick={refreshImages}
+              disabled={busy}
+              title="Refresh gallery"
+              aria-label="Refresh gallery"
+              data-tooltip="Refresh gallery"
+            >
+              <RefreshCw className={status === "loading" ? "spin" : ""} size={18} />
+            </button>
+          </nav>
+        </div>
+      </header>
 
-          <button
-            className="icon-button"
-            type="button"
-            onClick={pickRandom}
-            disabled={busy || images.length === 0}
-            title="Pick random image"
-            aria-label="Pick random image"
-          >
-            <Dices size={22} />
-          </button>
+      <section className="workspace" aria-label="Neuro Gallery image API">
+        <section className="notebook-sheet random-sheet">
+          <span className="paper-tape tape-cyan" aria-hidden="true" />
 
-          <button
-            className="icon-button"
-            type="button"
-            onClick={() => fetchImages().then(setImages).catch((err: Error) => setError(err.message))}
-            disabled={busy}
-            title="Refresh gallery"
-            aria-label="Refresh gallery"
-          >
-            <RefreshCw size={21} />
-          </button>
-        </aside>
-
-        <section className="main-stage">
-          <header className="topline">
+          <header className="sheet-heading">
             <div>
-              <p className="eyebrow">Random image API</p>
-              <h1>Neuro Gallery</h1>
+              <p className="eyebrow">
+                <Sparkles size={15} />
+                Random image API
+              </p>
+              <h1>Random transmission</h1>
             </div>
-            <div className="metric-cluster" aria-label="Gallery statistics">
-              <span>{images.length}</span>
-              <small>images live</small>
-            </div>
+            <span className={`pool-sticker ${images.length ? "ready" : ""}`}>
+              {images.length ? `${images.length} image${images.length === 1 ? "" : "s"} ready` : "Waiting for uploads"}
+            </span>
           </header>
 
-          <section className="hero-panel">
-            <div className="preview-frame">
-              {randomImage ? (
-                <img src={randomImage.url} alt={randomImage.name} />
-              ) : (
-                <div className="empty-preview">
-                  <UploadCloud size={48} />
-                  <span>No images yet</span>
-                </div>
-              )}
-            </div>
+          <div className={`preview-frame ${randomImage ? "has-image" : ""}`}>
+            <span className="on-air-sticker" aria-hidden="true">On air</span>
+            {randomImage ? (
+              <img src={randomImage.url} alt={randomImage.name} decoding="async" fetchPriority="high" />
+            ) : (
+              <div className="empty-preview">
+                <UploadCloud size={42} strokeWidth={1.8} />
+                <strong>No images yet</strong>
+                <span>Sign in and add the first upload</span>
+              </div>
+            )}
+          </div>
 
-            <div className="action-panel">
+          <div className="transmission-panel">
+            <div className="transmission-copy">
               <div>
                 <p className="label">Current random output</p>
                 <h2>{randomImage ? randomImage.name : "Waiting for uploads"}</h2>
-                <p className="status-copy">{error || message}</p>
               </div>
+              <p className={`status-copy ${error ? "error" : ""}`} aria-live="polite" aria-atomic="true">
+                {error || message}
+              </p>
+            </div>
 
-              <div className="endpoint-card">
-                <span>/random</span>
+            <div className="endpoint-actions">
+              <div className="endpoint-card" aria-label="Public random endpoint">
+                <span>{PUBLIC_RANDOM_PATH}</span>
                 <button type="button" onClick={copyRandomEndpoint} title="Copy endpoint" aria-label="Copy random endpoint">
                   <Copy size={17} />
                 </button>
@@ -378,7 +529,7 @@ export function App() {
               <div className="button-row">
                 <button className="primary-button" type="button" onClick={pickRandom} disabled={busy || images.length === 0}>
                   {status === "randomizing" ? <Loader2 className="spin" size={18} /> : <Dices size={18} />}
-                  Random
+                  Pick random
                 </button>
                 <a className={`secondary-button ${randomImage ? "" : "disabled"}`} href={randomUrl || undefined} target="_blank" rel="noreferrer">
                   <ArrowUpRight size={18} />
@@ -386,16 +537,30 @@ export function App() {
                 </a>
               </div>
 
-              <p className="hint">{copied ? "Endpoint copied." : "/api/random?format=json"}</p>
+              <p className="hint">{copied ? "Endpoint copied." : `${API_ROUTES.random}?format=json`}</p>
             </div>
-          </section>
+          </div>
         </section>
 
-        <aside className="gallery-panel">
+        <aside className="notebook-sheet gallery-panel">
+          <span className="paper-tape tape-pink" aria-hidden="true" />
+
+          <header className="gallery-title">
+            <div>
+              <p className="eyebrow">Private controls</p>
+              <h2>Upload library</h2>
+            </div>
+            <small>{status === "loading" ? "Loading" : selectedCount ? `${selectedCount} selected` : `${images.length} total`}</small>
+          </header>
+
           <form
             className={`auth-panel ${authenticated ? "authenticated" : ""}`}
             onSubmit={(event) => {
               event.preventDefault();
+              if (busy) {
+                return;
+              }
+
               if (authenticated) {
                 signOut();
               } else {
@@ -404,10 +569,10 @@ export function App() {
             }}
           >
             <div className="auth-copy">
-              {authenticated ? <ShieldCheck size={22} /> : <KeyRound size={22} />}
+              <span className="auth-icon">{authenticated ? <ShieldCheck size={20} /> : <KeyRound size={20} />}</span>
               <div>
                 <strong>{authenticated ? "Uploader signed in" : "Uploader sign in"}</strong>
-                <span>{authenticated ? "Mutations unlocked" : "Password required"}</span>
+                <span>{authenticated ? "Upload and delete are unlocked" : "Password required for changes"}</span>
               </div>
             </div>
 
@@ -423,6 +588,7 @@ export function App() {
                   value={password}
                   onChange={(event) => setPassword(event.target.value)}
                   placeholder="Upload password"
+                  aria-label="Upload password"
                   autoComplete="current-password"
                   disabled={authBusy}
                 />
@@ -438,7 +604,7 @@ export function App() {
             className={`drop-zone ${dragging ? "dragging" : ""} ${authenticated ? "" : "locked"}`}
             onDragEnter={(event) => {
               event.preventDefault();
-              if (authenticated) {
+              if (authenticated && !busy) {
                 setDragging(true);
               }
             }}
@@ -451,15 +617,15 @@ export function App() {
             role="button"
             tabIndex={0}
             onClick={() => {
-              if (authenticated) {
+              if (authenticated && !busy) {
                 fileInputRef.current?.click();
-              } else {
+              } else if (!authenticated) {
                 setError("Sign in to upload images.");
               }
             }}
             onKeyDown={(event) => {
               if (event.key === "Enter" || event.key === " ") {
-                if (authenticated) {
+                if (authenticated && !busy) {
                   fileInputRef.current?.click();
                 }
               }
@@ -476,14 +642,16 @@ export function App() {
             />
             <UploadCloud size={24} />
             <div>
-              <strong>{authenticated ? (status === "uploading" ? "Uploading..." : "Drop images") : "Upload locked"}</strong>
-              <span>{authenticated ? "PNG, JPEG, WebP, AVIF, GIF" : "Sign in first"}</span>
+              <strong>{authenticated ? (status === "uploading" ? "Uploading..." : "Drop images here") : "Upload locked"}</strong>
+              <span>{authenticated ? "PNG, JPEG, WebP, AVIF or GIF" : "Sign in to add files"}</span>
             </div>
           </div>
 
           <div className="gallery-header">
-            <span>Uploads</span>
-            <small>{status === "loading" ? "Loading" : selectedCount ? `${selectedCount} selected` : `${images.length} total`}</small>
+            <span>Latest uploads</span>
+            <button className="mini-refresh" type="button" onClick={refreshImages} disabled={busy} title="Refresh uploads" aria-label="Refresh uploads">
+              <RefreshCw className={status === "loading" ? "spin" : ""} size={15} />
+            </button>
           </div>
 
           <div className="selection-toolbar">
@@ -493,7 +661,7 @@ export function App() {
                 type="checkbox"
                 checked={allImagesSelected}
                 onChange={(event) => toggleAllImages(event.target.checked)}
-                disabled={!images.length || status === "deleting"}
+                disabled={!images.length || busy}
               />
               <span className="selection-box" aria-hidden="true" />
               <span className="selection-text">
@@ -505,7 +673,7 @@ export function App() {
               className="bulk-delete-button"
               type="button"
               onClick={removeSelectedImages}
-              disabled={!authenticated || status === "deleting" || selectedCount === 0}
+              disabled={!authenticated || busy || selectedCount === 0}
               title={authenticated ? "Delete selected images" : "Sign in to delete"}
             >
               {status === "deleting" ? <Loader2 className="spin" size={16} /> : <Trash2 size={16} />}
@@ -522,7 +690,7 @@ export function App() {
                       type="checkbox"
                       checked={selectedImageIdSet.has(image.id)}
                       onChange={() => toggleImageSelection(image.id)}
-                      disabled={status === "deleting"}
+                      disabled={busy}
                       aria-label={`Select ${image.name}`}
                     />
                     <span className="selection-box" aria-hidden="true" />
@@ -534,7 +702,7 @@ export function App() {
                     title={`Preview ${image.name}`}
                     aria-label={`Preview ${image.name}`}
                   >
-                    <img src={image.url} alt="" />
+                    <img src={image.url} alt="" loading="lazy" decoding="async" />
                   </button>
                   <div className="row-copy">
                     <strong>{image.name}</strong>
@@ -544,7 +712,7 @@ export function App() {
                     className="delete-button"
                     type="button"
                     onClick={() => removeImage(image.id)}
-                    disabled={status === "deleting" || !authenticated}
+                    disabled={busy || !authenticated}
                     title={authenticated ? "Delete image" : "Sign in to delete"}
                     aria-label={`Delete ${image.name}`}
                   >
@@ -555,7 +723,8 @@ export function App() {
             ) : (
               <div className="empty-list">
                 <ImagePlus size={28} />
-                <span>No uploads yet.</span>
+                <strong>Your library is empty</strong>
+                <span>Uploaded images will appear here.</span>
               </div>
             )}
           </div>
@@ -567,6 +736,16 @@ export function App() {
 
 function isAcceptedImageType(type: string) {
   return ACCEPTED_IMAGE_TYPES.includes(type as (typeof ACCEPTED_IMAGE_TYPES)[number]);
+}
+
+function mergeImagesByNewest(current: GalleryImage[], uploaded: GalleryImage[]) {
+  const imagesById = new Map(current.map((image) => [image.id, image]));
+
+  for (const image of uploaded) {
+    imagesById.set(image.id, image);
+  }
+
+  return Array.from(imagesById.values()).sort((left, right) => right.uploadedAt.localeCompare(left.uploadedAt));
 }
 
 function formatBytes(bytes: number) {

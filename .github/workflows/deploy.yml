@@ -15,15 +15,18 @@ jobs:
     name: Deploy Worker
     runs-on: ubuntu-latest
     environment: production
+    env:
+      IMAGE_BUCKET_NAME: neuro-gallery-images
+      STATE_BUCKET_NAME: neuro-gallery-state
     permissions:
       contents: read
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: npm
@@ -40,6 +43,8 @@ jobs:
           test -n "$CLOUDFLARE_API_TOKEN" || (echo "Missing CLOUDFLARE_API_TOKEN GitHub secret" && exit 1)
           test -n "$UPLOAD_PASSWORD" || (echo "Missing UPLOAD_PASSWORD GitHub secret" && exit 1)
           test -n "$AUTH_SECRET" || (echo "Missing AUTH_SECRET GitHub secret" && exit 1)
+          test "${#UPLOAD_PASSWORD}" -ge 12 || (echo "UPLOAD_PASSWORD must contain at least 12 characters" && exit 1)
+          test "${#AUTH_SECRET}" -ge 32 || (echo "AUTH_SECRET must contain at least 32 characters" && exit 1)
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -59,7 +64,8 @@ jobs:
             fi
           }
 
-          create_bucket "neuro-gallery-images"
+          create_bucket "$IMAGE_BUCKET_NAME"
+          create_bucket "$STATE_BUCKET_NAME"
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -78,6 +84,7 @@ jobs:
               UPLOAD_PASSWORD: process.env.UPLOAD_PASSWORD,
               AUTH_SECRET: process.env.AUTH_SECRET,
             }),
+            { mode: 0o600 },
           );
           NODE
         env:

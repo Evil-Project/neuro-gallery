@@ -2,6 +2,9 @@ name = "neuro-gallery"
 main = "src/worker.ts"
 compatibility_date = "2026-06-07"
 
+[vars]
+PUBLIC_IMAGE_BASE_URL = "https://images.evilneur.org/"
+
 [assets]
 directory = "./dist"
 binding = "ASSETS"
@@ -9,8 +12,27 @@ not_found_handling = "single-page-application"
 run_worker_first = ["/api/*", "/random"]
 
 [triggers]
-crons = ["0 */6 * * *"]
+crons = ["0 * * * *"]
+
+[[ratelimits]]
+name = "LOGIN_RATE_LIMITER"
+namespace_id = "734001"
+simple = { limit = 8, period = 60 }
+
+[[ratelimits]]
+name = "MUTATION_RATE_LIMITER"
+namespace_id = "734003"
+simple = { limit = 120, period = 60 }
+
+[[ratelimits]]
+name = "PUBLIC_API_RATE_LIMITER"
+namespace_id = "734002"
+simple = { limit = 300, period = 60 }
 
 [[r2_buckets]]
 binding = "IMAGES"
 bucket_name = "neuro-gallery-images"
+
+[[r2_buckets]]
+binding = "STATE"
+bucket_name = "neuro-gallery-state"
